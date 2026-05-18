@@ -51,9 +51,12 @@ logs/
 # On ignore tous les fichiers .jar par défaut (comme forge-sources.jar)
 *.jar
 
-# SAUF les fichiers .jar dans le dossier 'libs/' car ils contiennent 
+# SAUF les fichiers .jar dans le dossier 'libs/' car ils contiennent
 # vos dépendances de mods locales définies dans build.gradle !
 !libs/*.jar
+
+# Le JAR du Gradle Wrapper est indispensable pour lancer gradlew
+!gradle/wrapper/gradle-wrapper.jar
 
 # Cependant, on ignore le sous-dossier 'libs/old' qui contient les anciennes versions
 libs/old/
