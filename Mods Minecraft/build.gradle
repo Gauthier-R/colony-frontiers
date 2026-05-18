@@ -1,0 +1,58 @@
+plugins {
+    id 'java'
+    id 'eclipse'
+    id 'maven-publish'
+    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+}
+
+group = 'fr.gauthier'
+version = '1.0.0'
+archivesBaseName = 'colonyfrontiers' 
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+minecraft {
+    mappings channel: 'official', version: '1.20.1'
+    runs {
+        client {
+            workingDirectory project.file('run')
+            property 'mixin.env.remapRefMap', 'true' 
+            property 'mixin.env.refMapRemappingFile', "${projectDir}/build/createSrgToMcp/output.srg"
+        }
+    }
+}
+
+repositories {
+    maven { url 'https://maven.minecraftforge.net' }
+    mavenCentral()
+    // Dépôt local pour les JARs de mods tiers (libs/)
+    flatDir { dirs 'libs' }
+}
+
+dependencies { 
+    minecraft 'net.minecraftforge:forge:1.20.1-47.3.0'
+
+    implementation fg.deobf("local:minecolonies:1.20.1-1.1.1160-snapshot")
+    implementation fg.deobf("local:structurize:1.20.1-1.0.794")
+    implementation fg.deobf("local:blockui:1.20.1-1.0.190-snapshot")
+    implementation fg.deobf("local:domum_ornamentum:1.20.1-1.0.288-snapshot-universal")
+    implementation fg.deobf("local:multipiston:1.20-1.2.43-RELEASE")
+    
+    // Mods additionnels pour le serveur
+    implementation fg.deobf("local:minecolonytax:4.0.1")
+    implementation fg.deobf("local:towntalk:1.20.1-1.1.0")
+    
+    // Mods requis par War N Taxes
+    implementation fg.deobf("local:ftb-teams-forge:2001.3.2")
+    implementation fg.deobf("local:ftb-library-forge:2001.2.12")
+    implementation fg.deobf("local:architectury:9.2.14-forge")
+}
+
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8' 
+}
