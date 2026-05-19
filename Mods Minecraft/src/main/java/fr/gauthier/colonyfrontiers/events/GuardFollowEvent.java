@@ -17,12 +17,11 @@ import com.minecolonies.api.entity.citizen.AbstractEntityCitizen;
 @Mod.EventBusSubscriber(modid = ColonyFrontiers.MODID, bus = Mod.EventBusSubscriber.Bus.FORGE)
 public class GuardFollowEvent {
 
-    // ═══════════════════════════════════════════════════════════════
-    // HELPERS : Vérification stricte du rôle de garde
-    // ═══════════════════════════════════════════════════════════════
+    // ── HELPERS ────────────────────────────────────────────────────────────
 
     private static boolean isGuard(AbstractEntityCitizen c) {
-        return c.getCitizenData() != null && c.getCitizenData().getJob() != null
+        return c.getCitizenData() != null
+                && c.getCitizenData().getJob() != null
                 && c.getCitizenData().getJob().isGuard();
     }
 
@@ -38,85 +37,76 @@ public class GuardFollowEvent {
         citizen.setGlowingTag(false);
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // ENTITY INTERACT : Clic individuel ou Shift+Clic groupe
-    // ═══════════════════════════════════════════════════════════════
+    private static boolean isFollowing(AbstractEntityCitizen c, Player player) {
+        String uuid = c.getPersistentData().getString("FollowTarget");
+        return !uuid.isEmpty() && uuid.equals(player.getUUID().toString());
+    }
+
+    // ── INDIVIDUAL INTERACTION (right-click on guard) ──────────────────────
 
     @SubscribeEvent
     public static void onEntityInteract(PlayerInteractEvent.EntityInteract event) {
-        Player player = event.getEntity();
         if (!(event.getItemStack().getItem() instanceof CampaignBannerItem)) return;
 
         event.setCanceled(true);
         event.setCancellationResult(InteractionResult.SUCCESS);
-
         if (event.getLevel().isClientSide()) return;
 
-        // SHIFT+CLIC → Commande de groupe
+        Player player = event.getEntity();
+
         if (player.isShiftKeyDown()) {
             handleGroupCommand(player);
             return;
         }
 
-        // CLIC NORMAL → Recrutement / Renvoi individuel
-        if (event.getTarget() instanceof AbstractEntityCitizen citizen && isGuard(citizen)) {
-            String uuid = citizen.getPersistentData().getString("FollowTarget");
-            if (uuid != null && !uuid.isEmpty() && uuid.equals(player.getUUID().toString())) {
-                dismissGuard(citizen);
-                player.sendSystemMessage(Component.literal(
-                        "§c[Frontiers] " + citizen.getName().getString() + " quitte le régiment."));
-            } else {
-                enlistGuard(citizen, player);
-                player.sendSystemMessage(Component.literal(
-                        "§a[Frontiers] " + citizen.getName().getString() + " a rejoint le régiment !"));
-            }
+        if (!(event.getTarget() instanceof AbstractEntityCitizen citizen) || !isGuard(citizen)) return;
+
+        if (isFollowing(citizen, player)) {
+            dismissGuard(citizen);
+            player.sendSystemMessage(Component.literal(
+                    "§c[Frontiers] " + citizen.getName().getString() + " quitte le régiment."));
+        } else {
+            enlistGuard(citizen, player);
+            player.sendSystemMessage(Component.literal(
+                    "§a[Frontiers] " + citizen.getName().getString() + " a rejoint le régiment !"));
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // RIGHT CLICK ITEM : Shift+Clic dans le vide
-    // ═══════════════════════════════════════════════════════════════
+    // ── SHIFT+RIGHT-CLICK IN AIR ───────────────────────────────────────────
 
     @SubscribeEvent
     public static void onRightClickItem(PlayerInteractEvent.RightClickItem event) {
-        Player player = event.getEntity();
-        if (!event.getLevel().isClientSide() && event.getItemStack().getItem() instanceof CampaignBannerItem
-                && player.isShiftKeyDown()) {
-            handleGroupCommand(player);
-        }
+        if (event.getLevel().isClientSide()) return;
+        if (!(event.getItemStack().getItem() instanceof CampaignBannerItem)) return;
+        if (!event.getEntity().isShiftKeyDown()) return;
+        handleGroupCommand(event.getEntity());
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // GROUP COMMAND : Appel Général / Dissolution
-    // ═══════════════════════════════════════════════════════════════
+    // ── GROUP COMMAND ──────────────────────────────────────────────────────
 
     private static void handleGroupCommand(Player player) {
+        // Count followers in a wide radius (128 so combat-leashed guards are included)
         java.util.List<AbstractEntityCitizen> wide = player.level().getEntitiesOfClass(
-                AbstractEntityCitizen.class, player.getBoundingBox().inflate(64.0D));
+                AbstractEntityCitizen.class, player.getBoundingBox().inflate(128.0D));
 
-        // Comptage des gardes déjà en suivi
         int followingCount = 0;
         for (AbstractEntityCitizen c : wide) {
-            if (!isGuard(c)) continue;
-            String uuid = c.getPersistentData().getString("FollowTarget");
-            if (uuid != null && uuid.equals(player.getUUID().toString())) followingCount++;
+            if (isGuard(c) && isFollowing(c, player)) followingCount++;
         }
 
         if (followingCount > 0) {
-            // DISSOLUTION : Retire tous les gardes en suivi (rayon 64)
-            int count = 0;
+            // Dissolution — dismiss all followers found in that wide radius
+            int dismissed = 0;
             for (AbstractEntityCitizen c : wide) {
-                if (!isGuard(c)) continue;
-                String uuid = c.getPersistentData().getString("FollowTarget");
-                if (uuid != null && uuid.equals(player.getUUID().toString())) {
+                if (isGuard(c) && isFollowing(c, player)) {
                     dismissGuard(c);
-                    count++;
+                    dismissed++;
                 }
             }
             player.sendSystemMessage(Component.literal(
-                    "§c[Frontiers] Régiment dissous ! " + count + " gardes retournent à leurs postes."));
+                    "§c[Frontiers] Régiment dissous — " + dismissed + " gardes retournent à leurs postes."));
         } else {
-            // APPEL GÉNÉRAL : Recrute tous les gardes dans un rayon de 30
+            // Muster — recruit all guards within 30 blocks
             java.util.List<AbstractEntityCitizen> close = player.level().getEntitiesOfClass(
                     AbstractEntityCitizen.class, player.getBoundingBox().inflate(30.0D));
             int recruited = 0;
@@ -127,49 +117,43 @@ public class GuardFollowEvent {
             }
             if (recruited > 0) {
                 player.sendSystemMessage(Component.literal(
-                        "§a[Frontiers] Appel général ! " + recruited + " gardes ont rejoint le régiment !"));
+                        "§a[Frontiers] Appel général — " + recruited + " gardes ont rejoint le régiment !"));
             } else {
                 player.sendSystemMessage(Component.literal(
-                        "§e[Frontiers] Aucun garde trouvé dans un rayon de 30 blocs."));
+                        "§e[Frontiers] Aucun garde dans un rayon de 30 blocs."));
             }
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // ENTITY JOIN : Injection du Goal sur tous les citoyens
-    // ═══════════════════════════════════════════════════════════════
+    // ── ENTITY JOIN — inject Goal into every citizen on spawn ─────────────
+    // Goal.canUse() checks isGuard() each tick, so non-guards idle-out immediately.
 
     @SubscribeEvent
     public static void onEntityJoin(EntityJoinLevelEvent event) {
-        if (!event.getLevel().isClientSide() && event.getEntity() instanceof AbstractEntityCitizen citizen) {
-            citizen.goalSelector.addGoal(0, new FollowCommanderGoal(citizen));
-        }
+        if (event.getLevel().isClientSide()) return;
+        if (!(event.getEntity() instanceof AbstractEntityCitizen citizen)) return;
+        citizen.goalSelector.addGoal(0, new FollowCommanderGoal(citizen));
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    // PLAYER TICK : Cache NBT pour le isFoil de la bannière
-    // ═══════════════════════════════════════════════════════════════
+    // ── PLAYER TICK — maintain HasFollowers NBT for isFoil() ──────────────
+    // 128-block scan radius covers guards that are leashed out to 30 blocks
+    // plus teleport safety threshold (45 blocks). Once per second is sufficient.
 
     @SubscribeEvent
     public static void onPlayerTick(net.minecraftforge.event.TickEvent.PlayerTickEvent event) {
-        if (event.phase != net.minecraftforge.event.TickEvent.Phase.END || event.player.level().isClientSide())
-            return;
+        if (event.phase != net.minecraftforge.event.TickEvent.Phase.END) return;
+        if (event.player.level().isClientSide()) return;
+        if (event.player.tickCount % 20 != 0) return;
 
         Player player = event.player;
-        if (player.tickCount % 20 != 0) return;
+        String playerUuid = player.getUUID().toString();
 
-        boolean hasFollowers = false;
-        java.util.List<AbstractEntityCitizen> nearby = player.level().getEntitiesOfClass(
-                AbstractEntityCitizen.class, player.getBoundingBox().inflate(64.0D));
-
-        for (AbstractEntityCitizen c : nearby) {
-            if (!isGuard(c)) continue;
-            String uuid = c.getPersistentData().getString("FollowTarget");
-            if (uuid != null && uuid.equals(player.getUUID().toString())) {
-                hasFollowers = true;
-                break;
-            }
-        }
+        boolean hasFollowers = player.level()
+                .getEntitiesOfClass(AbstractEntityCitizen.class,
+                        player.getBoundingBox().inflate(128.0D))
+                .stream()
+                .filter(GuardFollowEvent::isGuard)
+                .anyMatch(c -> playerUuid.equals(c.getPersistentData().getString("FollowTarget")));
 
         for (int i = 0; i < player.getInventory().getContainerSize(); i++) {
             ItemStack stack = player.getInventory().getItem(i);
