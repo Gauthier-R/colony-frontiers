@@ -15,7 +15,10 @@ import net.minecraft.world.entity.ai.goal.Goal;
 import net.minecraft.world.entity.ai.memory.MemoryModuleType;
 import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.food.FoodProperties;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.AABB;
+import net.minecraftforge.items.IItemHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -59,6 +62,7 @@ public class FollowCommanderGoal extends Goal {
 
     private int     pathRecalcDelay  = 0;
     private int     attackCooldown   = 0;
+    private int     eatCooldown      = 0;  // timer indépendant pour tryEatFood()
     private int     scanCooldown     = 0;
     private int     hungerTicks      = 0;
     private double  lastSaturation   = -1.0D;
@@ -124,6 +128,7 @@ public class FollowCommanderGoal extends Goal {
         isEating        = false;
         currentMode     = Mode.NONE;
         citizen.getPersistentData().putBoolean("ForcedRetreat", false);
+        eatCooldown = 0;
         captureAndFreezeSM();
 
         boolean hasWeapon = !citizen.getMainHandItem().isEmpty();
@@ -242,6 +247,42 @@ public class FollowCommanderGoal extends Goal {
         } catch (Exception e) {
             return (double) ICitizenData.MAX_SATURATION;
         }
+    }
+
+    /**
+     * Consomme manuellement un item comestible dans l'inventaire du garde
+     * et applique la saturation résultante via ICitizenData.setSaturation().
+     * Appelé uniquement quand sat == 0 car la SM est figée et ne peut pas
+     * traiter NEEDS_FOOD. Retourne true si le garde a mangé quelque chose.
+     */
+    private boolean tryEatFood() {
+        ICitizenData data = citizen.getCitizenData();
+        if (data == null) return false;
+        try {
+            IItemHandler inv = citizen.getItemHandlerCitizen();
+            if (inv == null) return false;
+            for (int slot = 0; slot < inv.getSlots(); slot++) {
+                ItemStack stack = inv.getStackInSlot(slot);
+                if (stack.isEmpty()) continue;
+                FoodProperties food = stack.getItem().getFoodProperties(stack, citizen);
+                if (food == null) continue;
+                // Consomme un exemplaire
+                inv.extractItem(slot, 1, false);
+                double newSat = Math.min(ICitizenData.MAX_SATURATION,
+                        data.getSaturation() + food.getNutrition());
+                data.setSaturation(newSat);
+                lastSaturation = newSat;
+                hungerTicks    = 0;
+                LOG.info("[CF:Guard#{}:{}] MANGER {} sat: 0 → {}",
+                        citizen.getId(), citizen.getName().getString(),
+                        stack.getDisplayName().getString(),
+                        String.format("%.1f", newSat));
+                return true;
+            }
+        } catch (Exception e) {
+            LOG.debug("[CF:Guard#{}] tryEatFood erreur: {}", citizen.getId(), e.getMessage());
+        }
+        return false;
     }
 
     // ── COMBAT ────────────────────────────────────────────────────────────
@@ -454,16 +495,14 @@ public class FollowCommanderGoal extends Goal {
         // Mise à jour de l'état eating
         if (isEating && saturation >= EATING_STOP) isEating = false;
 
-        // ① FAMINE ABSOLUE (sat == 0) — ne peut pas combattre
+        // ① FAMINE (sat == 0) — tenter de manger en priorité.
+        // On ne bloque PAS le reste du tick : Focus Fire et combat passent quand même.
         if (saturation <= 0.0D) {
             isEating = true;
-            enforceSMFreeze();
-            citizen.clearRestriction();
-            clearCombatMemory();
-            citizen.getNavigation().stop();
-            citizen.getLookControl().setLookAt(commander, 10.0F, (float) citizen.getMaxHeadXRot());
-            logMode(Mode.EATING, "famine — combat impossible");
-            return;
+            if (--eatCooldown <= 0) {
+                boolean ate = tryEatFood();
+                eatCooldown = ate ? 40 : 10;
+            }
         }
 
         // ② TÉLÉPORTATION DE SÉCURITÉ (> 45 blocs)
@@ -564,13 +603,25 @@ public class FollowCommanderGoal extends Goal {
         // Validation navigation uniquement hors combat (pas de cible active)
         validateNavigation();
 
-        // ⑧ EATING volontaire — démarre quand sat ≤ 3, pas en combat
+        // ⑧ EATING volontaire — démarre quand sat ≤ 3, pas en combat.
+        // Appelle tryEatFood() une fois toutes les 40 ticks jusqu'à sat ≥ EATING_STOP.
         if (!isEating && saturation <= EATING_START) isEating = true;
 
         if (isEating) {
             enforceSMFreeze();
             citizen.getNavigation().stop();
             citizen.getLookControl().setLookAt(commander, 10.0F, (float) citizen.getMaxHeadXRot());
+            // Consomme activement — la SM figée ne peut pas traiter NEEDS_FOOD elle-même
+            if (--eatCooldown <= 0) {
+                boolean ate = tryEatFood();
+                eatCooldown = ate ? 40 : 20;
+                if (!ate) {
+                    // Plus rien à manger — sort du mode eating pour reprendre le suivi
+                    isEating = false;
+                    LOG.debug("[CF:Guard#{}:{}] plus de nourriture en inventaire, sortie EATING",
+                            citizen.getId(), citizen.getName().getString());
+                }
+            }
             logMode(Mode.EATING, String.format("sat=%.1f", saturation));
             return;
         }
