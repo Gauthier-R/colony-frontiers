@@ -5,14 +5,18 @@ import fr.gauthier.colonyfrontiers.ai.FollowCommanderGoal;
 import fr.gauthier.colonyfrontiers.items.CampaignBannerItem;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.InteractionResult;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.phys.BlockHitResult;
 import net.minecraftforge.event.entity.EntityJoinLevelEvent;
 import net.minecraftforge.event.entity.player.PlayerInteractEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
 
 import com.minecolonies.api.entity.citizen.AbstractEntityCitizen;
+
+import java.util.List;
 
 @Mod.EventBusSubscriber(modid = ColonyFrontiers.MODID, bus = Mod.EventBusSubscriber.Bus.FORGE)
 public class GuardFollowEvent {
@@ -42,7 +46,22 @@ public class GuardFollowEvent {
         return !uuid.isEmpty() && uuid.equals(player.getUUID().toString());
     }
 
-    // ── INDIVIDUAL INTERACTION (right-click on guard) ──────────────────────
+    /** Returns all guards currently following this player within 128 blocks. */
+    private static List<AbstractEntityCitizen> getFollowers(Player player) {
+        String playerUuid = player.getUUID().toString();
+        return player.level().getEntitiesOfClass(
+                        AbstractEntityCitizen.class,
+                        player.getBoundingBox().inflate(128.0D))
+                .stream()
+                .filter(c -> isGuard(c) && playerUuid.equals(
+                        c.getPersistentData().getString("FollowTarget")))
+                .toList();
+    }
+
+    // ── ENTITY INTERACT ────────────────────────────────────────────────────
+    // Right-click on a guard           → enlist / dismiss
+    // Right-click on a monster         → Focus Fire (if player has followers)
+    // Shift + right-click on anything  → group command
 
     @SubscribeEvent
     public static void onEntityInteract(PlayerInteractEvent.EntityInteract event) {
@@ -59,6 +78,26 @@ public class GuardFollowEvent {
             return;
         }
 
+        // Focus Fire — right-click on a monster while having followers
+        if (event.getTarget() instanceof LivingEntity target
+                && !(target instanceof AbstractEntityCitizen)
+                && !(target instanceof Player)) {
+            List<AbstractEntityCitizen> followers = getFollowers(player);
+            if (!followers.isEmpty()) {
+                String targetUuid = target.getUUID().toString();
+                for (AbstractEntityCitizen guard : followers) {
+                    guard.getPersistentData().putString("PriorityTarget", targetUuid);
+                    // Wipe hold ground so focus fire takes precedence
+                    guard.getPersistentData().putBoolean("IsHoldingGround", false);
+                }
+                player.sendSystemMessage(Component.literal(
+                        "§6[Frontiers] Focus Fire sur " + target.getName().getString()
+                                + " ! (" + followers.size() + " gardes)"));
+                return;
+            }
+        }
+
+        // Individual enlist / dismiss
         if (!(event.getTarget() instanceof AbstractEntityCitizen citizen) || !isGuard(citizen)) return;
 
         if (isFollowing(citizen, player)) {
@@ -72,21 +111,77 @@ public class GuardFollowEvent {
         }
     }
 
-    // ── SHIFT+RIGHT-CLICK IN AIR ───────────────────────────────────────────
+    // ── RIGHT-CLICK BLOCK ─────────────────────────────────────────────────
+    // Shift + right-click on ground  → Hold Ground at those coordinates
+    // (non-shift handled by RightClickItem / EntityInteract)
+
+    @SubscribeEvent
+    public static void onRightClickBlock(PlayerInteractEvent.RightClickBlock event) {
+        if (event.getLevel().isClientSide()) return;
+        if (!(event.getItemStack().getItem() instanceof CampaignBannerItem)) return;
+        if (!event.getEntity().isShiftKeyDown()) return;
+
+        Player player = event.getEntity();
+        List<AbstractEntityCitizen> followers = getFollowers(player);
+        if (followers.isEmpty()) {
+            player.sendSystemMessage(Component.literal(
+                    "§e[Frontiers] Aucun garde en suivi à poster."));
+            return;
+        }
+
+        BlockHitResult hit = event.getHitVec();
+        double hx = hit.getBlockPos().getX() + 0.5;
+        double hy = hit.getBlockPos().getY();
+        double hz = hit.getBlockPos().getZ() + 0.5;
+
+        for (AbstractEntityCitizen guard : followers) {
+            guard.getPersistentData().putBoolean("IsHoldingGround", true);
+            guard.getPersistentData().putDouble("HoldX", hx);
+            guard.getPersistentData().putDouble("HoldY", hy);
+            guard.getPersistentData().putDouble("HoldZ", hz);
+            guard.getPersistentData().remove("PriorityTarget");
+        }
+        player.sendSystemMessage(Component.literal(
+                "§b[Frontiers] Tenir la position ! " + followers.size()
+                        + " garde(s) postés en (" + (int) hx + ", " + (int) hy + ", " + (int) hz + ")."));
+
+        event.setCanceled(true);
+        event.setCancellationResult(InteractionResult.SUCCESS);
+    }
+
+    // ── RIGHT-CLICK ITEM (air / no entity hit) ─────────────────────────────
+    // Shift + air  → group command  (muster / dismiss)
+    // No shift     → cancel all tactical orders (hold ground + focus fire)
+    //               so guards return to normal follow mode
 
     @SubscribeEvent
     public static void onRightClickItem(PlayerInteractEvent.RightClickItem event) {
         if (event.getLevel().isClientSide()) return;
         if (!(event.getItemStack().getItem() instanceof CampaignBannerItem)) return;
-        if (!event.getEntity().isShiftKeyDown()) return;
-        handleGroupCommand(event.getEntity());
+
+        Player player = event.getEntity();
+
+        if (player.isShiftKeyDown()) {
+            handleGroupCommand(player);
+            return;
+        }
+
+        // Plain right-click in air — cancel tactical orders, back to follow
+        List<AbstractEntityCitizen> followers = getFollowers(player);
+        if (!followers.isEmpty()) {
+            for (AbstractEntityCitizen guard : followers) {
+                guard.getPersistentData().putBoolean("IsHoldingGround", false);
+                guard.getPersistentData().remove("PriorityTarget");
+            }
+            player.sendSystemMessage(Component.literal(
+                    "§a[Frontiers] Retour en formation — " + followers.size() + " gardes."));
+        }
     }
 
-    // ── GROUP COMMAND ──────────────────────────────────────────────────────
+    // ── GROUP COMMAND (shift) ──────────────────────────────────────────────
 
     private static void handleGroupCommand(Player player) {
-        // Count followers in a wide radius (128 so combat-leashed guards are included)
-        java.util.List<AbstractEntityCitizen> wide = player.level().getEntitiesOfClass(
+        List<AbstractEntityCitizen> wide = player.level().getEntitiesOfClass(
                 AbstractEntityCitizen.class, player.getBoundingBox().inflate(128.0D));
 
         int followingCount = 0;
@@ -95,7 +190,6 @@ public class GuardFollowEvent {
         }
 
         if (followingCount > 0) {
-            // Dissolution — dismiss all followers found in that wide radius
             int dismissed = 0;
             for (AbstractEntityCitizen c : wide) {
                 if (isGuard(c) && isFollowing(c, player)) {
@@ -106,8 +200,7 @@ public class GuardFollowEvent {
             player.sendSystemMessage(Component.literal(
                     "§c[Frontiers] Régiment dissous — " + dismissed + " gardes retournent à leurs postes."));
         } else {
-            // Muster — recruit all guards within 30 blocks
-            java.util.List<AbstractEntityCitizen> close = player.level().getEntitiesOfClass(
+            List<AbstractEntityCitizen> close = player.level().getEntitiesOfClass(
                     AbstractEntityCitizen.class, player.getBoundingBox().inflate(30.0D));
             int recruited = 0;
             for (AbstractEntityCitizen c : close) {
@@ -125,8 +218,7 @@ public class GuardFollowEvent {
         }
     }
 
-    // ── ENTITY JOIN — inject Goal into every citizen on spawn ─────────────
-    // Goal.canUse() checks isGuard() each tick, so non-guards idle-out immediately.
+    // ── ENTITY JOIN ────────────────────────────────────────────────────────
 
     @SubscribeEvent
     public static void onEntityJoin(EntityJoinLevelEvent event) {
@@ -135,9 +227,7 @@ public class GuardFollowEvent {
         citizen.goalSelector.addGoal(0, new FollowCommanderGoal(citizen));
     }
 
-    // ── PLAYER TICK — maintain HasFollowers NBT for isFoil() ──────────────
-    // 128-block scan radius covers guards that are leashed out to 30 blocks
-    // plus teleport safety threshold (45 blocks). Once per second is sufficient.
+    // ── PLAYER TICK — HasFollowers NBT pour isFoil() ──────────────────────
 
     @SubscribeEvent
     public static void onPlayerTick(net.minecraftforge.event.TickEvent.PlayerTickEvent event) {
