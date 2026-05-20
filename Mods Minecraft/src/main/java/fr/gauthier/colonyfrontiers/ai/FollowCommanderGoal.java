@@ -12,6 +12,9 @@ import net.minecraft.world.entity.ai.goal.Goal;
 import net.minecraft.world.entity.ai.memory.MemoryModuleType;
 import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.ai.attributes.AttributeModifier;
+import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.phys.AABB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -212,9 +215,36 @@ public class FollowCommanderGoal extends Goal {
     private void performAttack(LivingEntity target) {
         if (citizen.distanceToSqr(target) > MELEE_RANGE_SQ) return;
         if (--attackCooldown > 0) return;
-        citizen.doHurtTarget(target);
+
+        // citizen (EntityCitizen) does not register Attributes.ATTACK_DAMAGE —
+        // doHurtTarget() would crash with IllegalArgumentException at Mob.java:1398.
+        // Instead: read weapon damage from item modifiers, fall back to 4.0 bare-hands.
+        float damage = 4.0F;
+        try {
+            var weaponStack = citizen.getItemBySlot(EquipmentSlot.MAINHAND);
+            if (!weaponStack.isEmpty()) {
+                var mods = weaponStack.getAttributeModifiers(EquipmentSlot.MAINHAND)
+                        .get(Attributes.ATTACK_DAMAGE);
+                if (!mods.isEmpty()) {
+                    damage = 0.0F;
+                    for (AttributeModifier mod : mods) {
+                        damage += (float) mod.getAmount();
+                    }
+                    damage = Math.max(1.0F, damage);
+                }
+            }
+        } catch (Exception e) {
+            LOG.debug("[CF:Guard#{}] weapon damage read failed, using fallback 4.0: {}",
+                    citizen.getId(), e.getMessage());
+        }
+
+        target.hurt(citizen.damageSources().mobAttack(citizen), damage);
         citizen.swing(InteractionHand.MAIN_HAND);
         attackCooldown = ATTACK_RATE_TICKS;
+
+        LOG.debug("[CF:Guard#{}:{}] ATTACK target={} dmg={}",
+                citizen.getId(), citizen.getName().getString(),
+                target.getName().getString(), damage);
     }
 
     // ── PRIORITY TARGET ────────────────────────────────────────────────────
