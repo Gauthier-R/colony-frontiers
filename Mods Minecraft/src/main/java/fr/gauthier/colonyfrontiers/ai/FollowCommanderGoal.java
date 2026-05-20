@@ -7,14 +7,14 @@ import com.minecolonies.api.entity.ai.statemachine.states.IState;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.ai.attributes.AttributeModifier;
+import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.ai.goal.Goal;
 import net.minecraft.world.entity.ai.memory.MemoryModuleType;
 import net.minecraft.world.entity.monster.Monster;
 import net.minecraft.world.entity.player.Player;
-import net.minecraft.world.entity.EquipmentSlot;
-import net.minecraft.world.entity.ai.attributes.AttributeModifier;
-import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.phys.AABB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -29,25 +29,27 @@ import java.util.UUID;
  *
  * RÈGLE FONDAMENTALE : la SM MineColonies reste figée EN PERMANENCE pendant
  * toute la durée du suivi. On ne l'appelle JAMAIS via restoreSM() en cours de
- * tick (sauf stop()). Cela évite que GUARD_GUARD / GUARD_PATROL reprenne la
- * navigation et renvoie le garde à sa tour.
+ * tick. Cela évite que GUARD_GUARD / GUARD_PATROL / HOME reprennent.
  *
- * Les attaques sont pilotées manuellement via doHurtTarget() + swing().
+ * validateNavigation() annule chaque tick tout chemin qui dévie vers la maison
+ * du garde ou sa tour : protection contre les appels directs à navigation.moveTo()
+ * hors du système de Goals (colony tick, building tick).
  *
- * MODES (dans l'ordre de priorité) :
- *  ① Téléportation de sécurité (> 45 blocs)
- *  ② Forced Retreat
- *  ③ Priority Target (Focus Fire)
- *  ④ Leash check
- *  ⑤ Combat standard (scan centré commandant)
- *  ⑥ Hold Ground (coordonnées statiques)
- *  ⑦ Suivi / zone de confort
+ * PRIORITÉS dans tick() :
+ *  ① Manger de force si sat == 0 (ne peut pas combattre)
+ *  ② Téléportation de sécurité (> 45 blocs)
+ *  ③ Forced Retreat
+ *  ④ Priority Target (Focus Fire) — interrompt l'eating si sat > 0
+ *  ⑤ Leash check (> 30 blocs)
+ *  ⑥ Combat standard — interrompt l'eating si sat > 0
+ *  ⑦ Hold Ground (coordonnées statiques)
+ *  ⑧ Eating volontaire (sat ≤ 3)
+ *  ⑨ Suivi / zone de confort
  */
 public class FollowCommanderGoal extends Goal {
 
     private static final Logger LOG = LoggerFactory.getLogger("ColonyFrontiers/Goal");
 
-    // ── MODES pour le logging ──────────────────────────────────────────────
     private enum Mode { NONE, FOLLOW, COMFORT, COMBAT, PRIORITY, HOLD_GROUND, RETREAT, TELEPORT, EATING }
     private Mode currentMode = Mode.NONE;
     private int  logThrottle = 0;
@@ -55,16 +57,20 @@ public class FollowCommanderGoal extends Goal {
     private final AbstractEntityCitizen citizen;
     private Player commander;
 
-    private int    pathRecalcDelay = 0;
-    private int    attackCooldown  = 0;
-    private int    scanCooldown    = 0;
-    private int    hungerTicks     = 0;
-    private double lastSaturation  = -1.0D;
-    private int    originalTickRate = 1;
+    private int     pathRecalcDelay  = 0;
+    private int     attackCooldown   = 0;
+    private int     scanCooldown     = 0;
+    private int     hungerTicks      = 0;
+    private double  lastSaturation   = -1.0D;
+    private int     originalTickRate = 1;
+    private boolean isEating         = false;
 
     // ── CONSTANTES ─────────────────────────────────────────────────────────
     private static final int    SLOWED_TICK_RATE  = 999_999;
     private static final int    SCAN_INTERVAL     = 4;
+    private static final int    METABOLISM_FACTOR = 5;        // ×5 baisse de faim plus lente
+    private static final double EATING_START      = 3.0D;     // commence à manger sous ce seuil
+    private static final double EATING_STOP       = 6.0D;     // arrête de manger au-dessus
     private static final double COMFORT_NEAR_SQ   = 36.0D;    // 6²
     private static final double COMFORT_FAR_SQ    = 225.0D;   // 15²
     private static final double LEASH_SQ          = 900.0D;   // 30²
@@ -72,9 +78,11 @@ public class FollowCommanderGoal extends Goal {
     private static final double TELEPORT_SQ       = 2025.0D;  // 45²
     private static final double PRIORITY_MAX_SQ   = 2500.0D;  // 50²
     private static final double MELEE_RANGE_SQ    = 6.25D;    // 2.5²
-    private static final double HOLD_ARRIVE_2D_SQ = 9.0D;     // 3² (XZ only)
+    private static final double HOLD_ARRIVE_2D_SQ = 9.0D;     // 3² XZ uniquement
     private static final double HOLD_COMBAT_SQ    = 400.0D;   // 20²
-    private static final int    ATTACK_RATE_TICKS = 20;       // 1 attaque/s
+    private static final int    ATTACK_RATE_TICKS = 20;
+    // Si le chemin de navigation pointe à plus de 20 blocs de notre cible → annuler
+    private static final double NAV_DEVIATION_SQ  = 400.0D;
 
     public FollowCommanderGoal(AbstractEntityCitizen citizen) {
         this.citizen = citizen;
@@ -113,34 +121,34 @@ public class FollowCommanderGoal extends Goal {
         scanCooldown    = 0;
         lastSaturation  = -1.0D;
         hungerTicks     = 0;
+        isEating        = false;
         currentMode     = Mode.NONE;
         citizen.getPersistentData().putBoolean("ForcedRetreat", false);
         captureAndFreezeSM();
 
-        // Log weapon status at enlist time
         boolean hasWeapon = !citizen.getMainHandItem().isEmpty();
-        LOG.info("[CF:Guard#{}:{}] ENLIST — weapon={} job={}",
-                citizen.getId(),
-                citizen.getName().getString(),
-                hasWeapon ? citizen.getMainHandItem().getDisplayName().getString() : "NONE",
-                citizen.getCitizenData() != null ? citizen.getCitizenData().getJob().getJobRegistryEntry().getKey() : "?");
-        if (!hasWeapon) {
-            LOG.warn("[CF:Guard#{}:{}] No weapon in main hand — guard will use bare hands until dismissed.",
+        LOG.info("[CF:Guard#{}:{}] ENLIST weapon={} job={}",
+                citizen.getId(), citizen.getName().getString(),
+                hasWeapon ? citizen.getMainHandItem().getDisplayName().getString() : "AUCUNE",
+                citizen.getCitizenData() != null
+                        ? citizen.getCitizenData().getJob().getJobRegistryEntry().getKey() : "?");
+        if (!hasWeapon)
+            LOG.warn("[CF:Guard#{}:{}] Pas d'arme — combat à mains nues.",
                     citizen.getId(), citizen.getName().getString());
-        }
     }
 
     @Override
     public void stop() {
-        logTransition(Mode.NONE, "DISMISSED");
-        commander = null;
+        logTransition(Mode.NONE, "RENVOYÉ");
+        commander    = null;
+        isEating     = false;
         citizen.getNavigation().stop();
         citizen.getPersistentData().putBoolean("ForcedRetreat", false);
         citizen.setGlowingTag(false);
-        restoreSM(); // Only place we restore — SM resumes normal colony AI (requests, patrol, etc.)
+        restoreSM(); // seul endroit où on restaure la SM
     }
 
-    // ── SM MANAGEMENT — SM reste figée pendant tout le suivi ──────────────
+    // ── SM MANAGEMENT ─────────────────────────────────────────────────────
 
     private void captureAndFreezeSM() {
         try {
@@ -152,10 +160,7 @@ public class FollowCommanderGoal extends Goal {
         } catch (Exception ignored) {}
     }
 
-    /**
-     * Ré-appliqué CHAQUE tick pour résister aux resets externes
-     * (colony tick, building tick, soin, level-up).
-     */
+    /** Ré-appliqué CHAQUE tick : résiste aux resets du colony/building tick. */
     private void enforceSMFreeze() {
         try {
             ITickRateStateMachine<IState> sm = citizen.getEntityStateController();
@@ -174,33 +179,72 @@ public class FollowCommanderGoal extends Goal {
         } catch (Exception ignored) {}
     }
 
-    // ── MÉTABOLISME 20× ───────────────────────────────────────────────────
-    // Intercept 19/20 drops. Hard floor à 1.0 → jamais de particules bleues.
+    // ── VALIDATION NAVIGATION ─────────────────────────────────────────────
+    // Vérifie que le chemin actuel pointe vers notre cible et non vers
+    // la maison/tour du garde (injection directe de navigation par MineColonies
+    // depuis colony tick hors système de Goals).
+
+    private void validateNavigation() {
+        if (citizen.getNavigation().isDone()) return;
+        var targetPos = citizen.getNavigation().getTargetPos();
+        if (targetPos == null) return;
+
+        boolean holdGround = citizen.getPersistentData().getBoolean("IsHoldingGround");
+        double tgtX, tgtZ;
+        if (holdGround) {
+            tgtX = citizen.getPersistentData().getDouble("HoldX");
+            tgtZ = citizen.getPersistentData().getDouble("HoldZ");
+        } else if (commander != null) {
+            tgtX = commander.getX();
+            tgtZ = commander.getZ();
+        } else {
+            return;
+        }
+
+        double dx = targetPos.getX() - tgtX;
+        double dz = targetPos.getZ() - tgtZ;
+        if (dx * dx + dz * dz > NAV_DEVIATION_SQ) {
+            citizen.getNavigation().stop();
+            pathRecalcDelay = 0;
+            LOG.debug("[CF:Guard#{}] chemin déviant annulé (cible=({},{}), nav cible=({},{}))",
+                    citizen.getId(), (int) tgtX, (int) tgtZ, targetPos.getX(), targetPos.getZ());
+        }
+    }
+
+    // ── MÉTABOLISME ×5 ────────────────────────────────────────────────────
+    // Intercepte 4/5 des baisses de saturation → baisse ×5 plus lente.
+    // Pas de plancher artificiel : la saturation peut atteindre 0 naturellement.
 
     private void manageMetabolism() {
         ICitizenData data = citizen.getCitizenData();
         if (data == null) return;
         try {
             double current = data.getSaturation();
-            if (current < 1.0D) { data.setSaturation(1.0D); lastSaturation = 1.0D; return; }
             if (lastSaturation < 0.0D) { lastSaturation = current; return; }
             if (current < lastSaturation) {
-                if (++hungerTicks < 20) {
-                    data.setSaturation(lastSaturation);
+                if (++hungerTicks < METABOLISM_FACTOR) {
+                    data.setSaturation(lastSaturation); // restaure
                 } else {
                     hungerTicks    = 0;
-                    lastSaturation = Math.max(1.0D, current);
+                    lastSaturation = current; // 1/5 baisses passent
                 }
             } else if (current > lastSaturation) {
-                lastSaturation = current;
+                lastSaturation = current; // a mangé
                 hungerTicks    = 0;
             }
         } catch (Exception ignored) {}
     }
 
-    // ── COMBAT — attaques manuelles (SM figée) ────────────────────────────
-    // doHurtTarget() utilise les attributs de l'entité + l'arme en main.
-    // Pas besoin de restoreSM() : on évite ainsi que GUARD_GUARD reprenne.
+    private double getSaturationSafe() {
+        try {
+            ICitizenData data = citizen.getCitizenData();
+            return data != null ? data.getSaturation() : (double) ICitizenData.MAX_SATURATION;
+        } catch (Exception e) {
+            return (double) ICitizenData.MAX_SATURATION;
+        }
+    }
+
+    // ── COMBAT ────────────────────────────────────────────────────────────
 
     private void clearCombatMemory() {
         citizen.setTarget(null);
@@ -216,9 +260,6 @@ public class FollowCommanderGoal extends Goal {
         if (citizen.distanceToSqr(target) > MELEE_RANGE_SQ) return;
         if (--attackCooldown > 0) return;
 
-        // citizen (EntityCitizen) does not register Attributes.ATTACK_DAMAGE —
-        // doHurtTarget() would crash with IllegalArgumentException at Mob.java:1398.
-        // Instead: read weapon damage from item modifiers, fall back to 4.0 bare-hands.
         float damage = 4.0F;
         try {
             var weaponStack = citizen.getItemBySlot(EquipmentSlot.MAINHAND);
@@ -227,28 +268,24 @@ public class FollowCommanderGoal extends Goal {
                         .get(Attributes.ATTACK_DAMAGE);
                 if (!mods.isEmpty()) {
                     damage = 0.0F;
-                    for (AttributeModifier mod : mods) {
-                        damage += (float) mod.getAmount();
-                    }
+                    for (AttributeModifier mod : mods) damage += (float) mod.getAmount();
                     damage = Math.max(1.0F, damage);
                 }
             }
         } catch (Exception e) {
-            LOG.debug("[CF:Guard#{}] weapon damage read failed, using fallback 4.0: {}",
+            LOG.debug("[CF:Guard#{}] lecture dégâts arme échouée, fallback 4.0: {}",
                     citizen.getId(), e.getMessage());
         }
 
         target.hurt(citizen.damageSources().mobAttack(citizen), damage);
         citizen.swing(InteractionHand.MAIN_HAND);
         attackCooldown = ATTACK_RATE_TICKS;
-
-        LOG.debug("[CF:Guard#{}:{}] ATTACK target={} dmg={}",
+        LOG.debug("[CF:Guard#{}:{}] ATTAQUE cible={} dégâts={}",
                 citizen.getId(), citizen.getName().getString(),
                 target.getName().getString(), damage);
     }
 
     // ── PRIORITY TARGET ────────────────────────────────────────────────────
-    // Auto-clear si cible morte/disparue.
 
     private LivingEntity getPriorityTarget() {
         String uuidStr = citizen.getPersistentData().getString("PriorityTarget");
@@ -262,7 +299,7 @@ public class FollowCommanderGoal extends Goal {
         } catch (IllegalArgumentException ignored) {}
         citizen.getPersistentData().remove("PriorityTarget");
         clearCombatMemory();
-        LOG.info("[CF:Guard#{}:{}] PriorityTarget cleared (dead/despawned)",
+        LOG.info("[CF:Guard#{}:{}] PriorityTarget effacé (mort/despawn)",
                 citizen.getId(), citizen.getName().getString());
         return null;
     }
@@ -306,16 +343,13 @@ public class FollowCommanderGoal extends Goal {
         List<Monster> threats = citizen.level().getEntitiesOfClass(
                 Monster.class,
                 new AABB(hx - 20, hy - 4, hz - 20, hx + 20, hy + 8, hz + 20),
-                m -> m.isAlive()
-                        && m.distanceToSqr(hx, hy, hz) <= HOLD_COMBAT_SQ);
+                m -> m.isAlive() && m.distanceToSqr(hx, hy, hz) <= HOLD_COMBAT_SQ);
         if (!threats.isEmpty())
             threats.stream().min(Comparator.comparingDouble(m -> m.distanceToSqr(hx, hy, hz)))
                    .ifPresent(citizen::setTarget);
     }
 
     // ── HOLD GROUND ───────────────────────────────────────────────────────
-    // Utilise la distance 2D (XZ) pour l'arrivée : évite le bug où
-    // le garde à y=holdY+1 croit être à holdY et ne bouge pas.
 
     private void tickHoldGround() {
         double hx = citizen.getPersistentData().getDouble("HoldX");
@@ -327,25 +361,23 @@ public class FollowCommanderGoal extends Goal {
 
         if (target != null && target.isAlive()) {
             if (target.distanceToSqr(hx, hy, hz) <= HOLD_COMBAT_SQ) {
-                // Combat sur place — SM figée, on attaque manuellement
                 enforceSMFreeze();
                 citizen.clearRestriction();
                 citizen.getLookControl().setLookAt(target, 10.0F, (float) citizen.getMaxHeadXRot());
                 if (--pathRecalcDelay <= 0 || citizen.getNavigation().isDone()) {
                     citizen.clearRestriction();
                     citizen.getNavigation().moveTo(target, 1.30D);
-                    pathRecalcDelay = 15;
+                    pathRecalcDelay = 8;
                 }
                 performAttack(target);
-                logMode(Mode.COMBAT, String.format("HoldGround combat dist=%.1f", Math.sqrt(target.distanceToSqr(hx, hy, hz))));
+                logMode(Mode.COMBAT, String.format("HoldGround dist=%.1f",
+                        Math.sqrt(target.distanceToSqr(hx, hy, hz))));
                 return;
             }
-            clearCombatMemory(); // cible sortie du périmètre
+            clearCombatMemory();
         }
 
         enforceSMFreeze();
-
-        // Distance 2D (XZ) uniquement pour l'arrivée
         double dx = citizen.getX() - hx;
         double dz = citizen.getZ() - hz;
         double dist2DSq = dx * dx + dz * dz;
@@ -354,11 +386,10 @@ public class FollowCommanderGoal extends Goal {
             if (--pathRecalcDelay <= 0 || citizen.getNavigation().isDone()) {
                 citizen.clearRestriction();
                 citizen.getNavigation().moveTo(hx, hy, hz, 1.15D);
-                pathRecalcDelay = 20;
+                pathRecalcDelay = 10;
             }
-            logMode(Mode.HOLD_GROUND, String.format("moving dist2D=%.1f", Math.sqrt(dist2DSq)));
+            logMode(Mode.HOLD_GROUND, String.format("mouvement dist2D=%.1f", Math.sqrt(dist2DSq)));
         } else {
-            // Arrivé — petite patrouille locale
             if (--pathRecalcDelay <= 0) {
                 if (citizen.getRandom().nextFloat() < 0.4F) {
                     double px = hx + (citizen.getRandom().nextDouble() - 0.5) * 10.0;
@@ -370,13 +401,11 @@ public class FollowCommanderGoal extends Goal {
                 }
                 pathRecalcDelay = 80;
             }
-            logMode(Mode.HOLD_GROUND, "patrolling");
+            logMode(Mode.HOLD_GROUND, "patrouille");
         }
     }
 
     // ── NAVIGATION HELPER ─────────────────────────────────────────────────
-    // clearRestriction() juste avant moveTo() : la guard tower pose
-    // setRestrictArea() après le tick IA, pas avant.
 
     private void navigateTo(LivingEntity target, double speed, int interval) {
         if (--pathRecalcDelay <= 0 || citizen.getNavigation().isDone()) {
@@ -401,10 +430,10 @@ public class FollowCommanderGoal extends Goal {
             logTransition(mode, detail);
         } else if (++logThrottle >= 100) {
             LOG.info("[CF:Guard#{}:{}] [{}] {} | sat={} dist={}",
-                    citizen.getId(), citizen.getName().getString(),
-                    mode, detail,
+                    citizen.getId(), citizen.getName().getString(), mode, detail,
                     String.format("%.1f", lastSaturation),
-                    commander != null ? String.format("%.1f", Math.sqrt(citizen.distanceToSqr(commander))) : "?");
+                    commander != null ? String.format("%.1f",
+                            Math.sqrt(citizen.distanceToSqr(commander))) : "?");
             logThrottle = 0;
         }
     }
@@ -415,13 +444,29 @@ public class FollowCommanderGoal extends Goal {
     public void tick() {
         if (commander == null) return;
 
-        // Métabolisme — exécuté en tout premier, chaque tick
+        // Métabolisme : ×5 — exécuté avant tout le reste
         manageMetabolism();
 
-        double distSq   = citizen.distanceToSqr(commander);
-        boolean retreat = citizen.getPersistentData().getBoolean("ForcedRetreat");
+        double saturation = getSaturationSafe();
+        double distSq     = citizen.distanceToSqr(commander);
+        boolean retreat   = citizen.getPersistentData().getBoolean("ForcedRetreat");
 
-        // ① TÉLÉPORTATION DE SÉCURITÉ (> 45 blocs)
+        // Mise à jour de l'état eating
+        if (isEating && saturation >= EATING_STOP) isEating = false;
+
+        // ① FAMINE ABSOLUE (sat == 0) — ne peut pas combattre
+        if (saturation <= 0.0D) {
+            isEating = true;
+            enforceSMFreeze();
+            citizen.clearRestriction();
+            clearCombatMemory();
+            citizen.getNavigation().stop();
+            citizen.getLookControl().setLookAt(commander, 10.0F, (float) citizen.getMaxHeadXRot());
+            logMode(Mode.EATING, "famine — combat impossible");
+            return;
+        }
+
+        // ② TÉLÉPORTATION DE SÉCURITÉ (> 45 blocs)
         if (distSq > TELEPORT_SQ) {
             clearCombatMemory();
             citizen.teleportTo(commander.getX(), commander.getY(), commander.getZ());
@@ -434,10 +479,10 @@ public class FollowCommanderGoal extends Goal {
             return;
         }
 
-        // Restriction territoriale — toujours effacée avant les calculs de chemin
+        // Effacement territorial (guard tower pose setRestrictArea après le tick IA)
         citizen.clearRestriction();
 
-        // ② FORCED RETREAT — retour forcé, ignorer tous les combats
+        // ③ FORCED RETREAT
         if (retreat) {
             clearCombatMemory();
             enforceSMFreeze();
@@ -445,108 +490,102 @@ public class FollowCommanderGoal extends Goal {
             if (distSq <= RETREAT_END_SQ) {
                 citizen.getPersistentData().putBoolean("ForcedRetreat", false);
                 citizen.getNavigation().stop();
-                logTransition(Mode.FOLLOW, "retreat resolved");
+                logTransition(Mode.FOLLOW, "retreat résolu");
             } else {
-                navigateTo(commander, 1.35D, 10);
+                navigateTo(commander, 1.35D, 5);
                 logMode(Mode.RETREAT, String.format("dist=%.1f", Math.sqrt(distSq)));
             }
             return;
         }
 
-        // ③ PRIORITY TARGET (Focus Fire) — priorité absolue sur tous les modes
+        // ④ PRIORITY TARGET (Focus Fire) — interrompt l'eating si sat > 0
         LivingEntity priorityTarget = getPriorityTarget();
         if (priorityTarget != null) {
             if (commander.distanceToSqr(priorityTarget) > PRIORITY_MAX_SQ) {
                 citizen.getPersistentData().remove("PriorityTarget");
                 clearCombatMemory();
-                logTransition(Mode.FOLLOW, "priority target out of range");
+                logTransition(Mode.FOLLOW, "priority hors portée");
             } else {
-                enforceSMFreeze(); // SM figée — on pilote manuellement
+                isEating = false; // interrompt le repas pour combattre
+                enforceSMFreeze();
                 citizen.clearRestriction();
                 citizen.setTarget(priorityTarget);
                 citizen.getLookControl().setLookAt(priorityTarget, 10.0F, (float) citizen.getMaxHeadXRot());
                 if (--pathRecalcDelay <= 0 || citizen.getNavigation().isDone()) {
                     citizen.clearRestriction();
                     citizen.getNavigation().moveTo(priorityTarget, 1.35D);
-                    pathRecalcDelay = 10;
+                    pathRecalcDelay = 8;
                 }
                 performAttack(priorityTarget);
-                logMode(Mode.PRIORITY, String.format("target=%s dist=%.1f",
+                logMode(Mode.PRIORITY, String.format("cible=%s dist=%.1f",
                         priorityTarget.getName().getString(),
                         Math.sqrt(citizen.distanceToSqr(priorityTarget))));
                 return;
             }
         }
 
-        // ④ LEASH CHECK — cibles mortes nettoyées avant le test de distance
+        // ⑤ LEASH CHECK
         LivingEntity target = citizen.getTarget();
-        if (target != null && !target.isAlive()) {
-            clearCombatMemory();
-            target = null;
-        }
+        if (target != null && !target.isAlive()) { clearCombatMemory(); target = null; }
         if (distSq > LEASH_SQ || (target != null && commander.distanceToSqr(target) > LEASH_SQ)) {
             citizen.getPersistentData().putBoolean("ForcedRetreat", true);
             clearCombatMemory();
             enforceSMFreeze();
-            navigateTo(commander, 1.35D, 10);
-            logTransition(Mode.RETREAT, String.format("leash dist=%.1f", Math.sqrt(distSq)));
+            navigateTo(commander, 1.35D, 5);
+            logTransition(Mode.RETREAT, String.format("laisse dist=%.1f", Math.sqrt(distSq)));
             return;
         }
 
-        // ⑤ COMBAT STANDARD (scan centré commandant)
+        // ⑥ COMBAT STANDARD (scan centré commandant) — interrompt l'eating si sat > 0
         scanForThreats();
         target = citizen.getTarget();
         if (target != null && target.isAlive()) {
-            enforceSMFreeze(); // SM figée — on gère le combat manuellement
+            isEating = false; // interrompt le repas pour combattre
+            enforceSMFreeze();
             citizen.clearRestriction();
             citizen.getLookControl().setLookAt(target, 10.0F, (float) citizen.getMaxHeadXRot());
             if (--pathRecalcDelay <= 0 || citizen.getNavigation().isDone()) {
                 citizen.clearRestriction();
                 citizen.getNavigation().moveTo(target, 1.30D);
-                pathRecalcDelay = 15;
+                pathRecalcDelay = 8;
             }
             performAttack(target);
-            logMode(Mode.COMBAT, String.format("target=%s dist=%.1f",
-                    target.getName().getString(),
-                    Math.sqrt(citizen.distanceToSqr(target))));
+            logMode(Mode.COMBAT, String.format("cible=%s dist=%.1f",
+                    target.getName().getString(), Math.sqrt(citizen.distanceToSqr(target))));
             return;
         }
 
-        // ⑥ HOLD GROUND — défense de coordonnées statiques
+        // ⑦ HOLD GROUND
         if (citizen.getPersistentData().getBoolean("IsHoldingGround")) {
             tickHoldGround();
             return;
         }
 
-        // ⑦ SUIVI / ZONE DE CONFORT
-        boolean isHungry = false;
-        try {
-            ICitizenData data = citizen.getCitizenData();
-            if (data != null) isHungry = data.getSaturation() < (ICitizenData.MAX_SATURATION / 2.0D);
-        } catch (Exception ignored) {}
+        // Validation navigation uniquement hors combat (pas de cible active)
+        validateNavigation();
 
-        // Fenêtre de nourriture : faim + zone de confort (6–15 blocs)
-        // La saturation 20x + floor à 1.0 gère les particules bleues.
-        // On arrête juste le mouvement pour laisser le garde se comporter naturellement.
-        if (isHungry && distSq > COMFORT_NEAR_SQ && distSq <= COMFORT_FAR_SQ) {
+        // ⑧ EATING volontaire — démarre quand sat ≤ 3, pas en combat
+        if (!isEating && saturation <= EATING_START) isEating = true;
+
+        if (isEating) {
             enforceSMFreeze();
             citizen.getNavigation().stop();
             citizen.getLookControl().setLookAt(commander, 10.0F, (float) citizen.getMaxHeadXRot());
-            logMode(Mode.EATING, String.format("sat=%.1f", lastSaturation));
+            logMode(Mode.EATING, String.format("sat=%.1f", saturation));
             return;
         }
 
+        // ⑨ SUIVI / ZONE DE CONFORT
         enforceSMFreeze();
         citizen.getLookControl().setLookAt(commander, 10.0F, (float) citizen.getMaxHeadXRot());
 
         if (distSq > COMFORT_FAR_SQ) {
-            navigateTo(commander, 1.25D, 10);
+            navigateTo(commander, 1.25D, 8);
             logMode(Mode.FOLLOW, String.format("dist=%.1f", Math.sqrt(distSq)));
         } else if (distSq <= COMFORT_NEAR_SQ) {
             citizen.getNavigation().stop();
-            logMode(Mode.COMFORT, "close");
+            logMode(Mode.COMFORT, "proche");
         } else {
-            // Zone de confort 6–15 blocs — petite errance naturelle
             if (--pathRecalcDelay <= 0) {
                 if (citizen.getRandom().nextFloat() < 0.1F) {
                     double wx = commander.getX() + (citizen.getRandom().nextDouble() - 0.5) * 10;
