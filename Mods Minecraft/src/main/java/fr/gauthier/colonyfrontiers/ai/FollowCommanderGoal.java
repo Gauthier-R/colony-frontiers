@@ -30,24 +30,25 @@ import java.util.UUID;
 /**
  * Suivi militaire pour gardes MineColonies — Phase 2.
  *
- * RÈGLE FONDAMENTALE : la SM MineColonies reste figée EN PERMANENCE pendant
- * toute la durée du suivi. On ne l'appelle JAMAIS via restoreSM() en cours de
- * tick. Cela évite que GUARD_GUARD / GUARD_PATROL / HOME reprennent.
+ * RÈGLE FONDAMENTALE : la SM MineColonies reste figée EN PERMANENCE sauf
+ * pendant l'EATING confort (⑧). restoreSM() n'est appelé que dans ce cas précis
+ * et est immédiatement repris par captureAndFreezeSM() dès que le combat reprend.
  *
  * validateNavigation() annule chaque tick tout chemin qui dévie vers la maison
  * du garde ou sa tour : protection contre les appels directs à navigation.moveTo()
  * hors du système de Goals (colony tick, building tick).
  *
  * PRIORITÉS dans tick() :
- *  ① Manger de force si sat == 0 (ne peut pas combattre)
+ *  ① Famine (sat == 0) — tryEatFood() en parallèle, ne bloque pas le combat
  *  ② Téléportation de sécurité (> 45 blocs)
  *  ③ Forced Retreat
- *  ④ Priority Target (Focus Fire) — interrompt l'eating si sat > 0
+ *  ④ Priority Target (Focus Fire) — interrompt eating, reprend SM freeze
  *  ⑤ Leash check (> 30 blocs)
- *  ⑥ Combat standard — interrompt l'eating si sat > 0
+ *  ⑥ Combat standard — interrompt eating, reprend SM freeze
  *  ⑦ Hold Ground (coordonnées statiques)
- *  ⑧ Eating volontaire (sat ≤ 3)
- *  ⑨ Suivi / zone de confort
+ *  ⑧ Eating confort (sat ≤ 50%, zone 6-15 blocs) — libère SM, anim native
+ *  ⑩ Eating famine manuel (sat ≤ 3, SM figée)
+ *  ⑪ Suivi / zone de confort
  */
 public class FollowCommanderGoal extends Goal {
 
@@ -67,14 +68,17 @@ public class FollowCommanderGoal extends Goal {
     private int     hungerTicks      = 0;
     private double  lastSaturation   = -1.0D;
     private int     originalTickRate = 1;
-    private boolean isEating         = false;
+    private boolean isEating         = false;  // famine — tryEatFood() manuel
+    private boolean isSmEating       = false;  // confort — SM libérée pour anim EATING
 
     // ── CONSTANTES ─────────────────────────────────────────────────────────
     private static final int    SLOWED_TICK_RATE  = 999_999;
     private static final int    SCAN_INTERVAL     = 4;
-    private static final int    METABOLISM_FACTOR = 5;        // ×5 baisse de faim plus lente
-    private static final double EATING_START      = 3.0D;     // commence à manger sous ce seuil
-    private static final double EATING_STOP       = 6.0D;     // arrête de manger au-dessus
+    private static final int    METABOLISM_FACTOR = 20;       // ×20 baisse de faim plus lente (GDD: exactly 20x)
+    private static final double EATING_START      = 3.0D;     // seuil famine : tryEatFood() manuel
+    private static final double EATING_STOP       = 6.0D;     // sortie famine
+    private static final double SM_EAT_START      = 10.0D;    // 50% de 20 — libère la SM pour l'anim EATING
+    private static final double SM_EAT_STOP       = 16.0D;    // reprend le contrôle quand rassasié
     private static final double COMFORT_NEAR_SQ   = 36.0D;    // 6²
     private static final double COMFORT_FAR_SQ    = 225.0D;   // 15²
     private static final double LEASH_SQ          = 900.0D;   // 30²
@@ -126,6 +130,7 @@ public class FollowCommanderGoal extends Goal {
         lastSaturation  = -1.0D;
         hungerTicks     = 0;
         isEating        = false;
+        isSmEating      = false;
         currentMode     = Mode.NONE;
         citizen.getPersistentData().putBoolean("ForcedRetreat", false);
         eatCooldown = 0;
@@ -147,10 +152,11 @@ public class FollowCommanderGoal extends Goal {
         logTransition(Mode.NONE, "RENVOYÉ");
         commander    = null;
         isEating     = false;
+        isSmEating   = false;
         citizen.getNavigation().stop();
         citizen.getPersistentData().putBoolean("ForcedRetreat", false);
         citizen.setGlowingTag(false);
-        restoreSM(); // seul endroit où on restaure la SM
+        restoreSM();
     }
 
     // ── SM MANAGEMENT ─────────────────────────────────────────────────────
@@ -485,15 +491,19 @@ public class FollowCommanderGoal extends Goal {
     public void tick() {
         if (commander == null) return;
 
-        // Métabolisme : ×5 — exécuté avant tout le reste
+        // Métabolisme : ×20 — exécuté avant tout le reste
         manageMetabolism();
 
         double saturation = getSaturationSafe();
         double distSq     = citizen.distanceToSqr(commander);
         boolean retreat   = citizen.getPersistentData().getBoolean("ForcedRetreat");
 
-        // Mise à jour de l'état eating
+        // Mise à jour des états eating
         if (isEating && saturation >= EATING_STOP) isEating = false;
+        if (isSmEating && saturation >= SM_EAT_STOP) {
+            isSmEating = false;
+            captureAndFreezeSM(); // reprend le contrôle
+        }
 
         // ① FAMINE (sat == 0) — tenter de manger en priorité.
         // On ne bloque PAS le reste du tick : Focus Fire et combat passent quand même.
@@ -545,7 +555,8 @@ public class FollowCommanderGoal extends Goal {
                 clearCombatMemory();
                 logTransition(Mode.FOLLOW, "priority hors portée");
             } else {
-                isEating = false; // interrompt le repas pour combattre
+                isEating = false;
+                if (isSmEating) { isSmEating = false; captureAndFreezeSM(); }
                 enforceSMFreeze();
                 citizen.clearRestriction();
                 citizen.setTarget(priorityTarget);
@@ -579,7 +590,8 @@ public class FollowCommanderGoal extends Goal {
         scanForThreats();
         target = citizen.getTarget();
         if (target != null && target.isAlive()) {
-            isEating = false; // interrompt le repas pour combattre
+            isEating = false;
+            if (isSmEating) { isSmEating = false; captureAndFreezeSM(); }
             enforceSMFreeze();
             citizen.clearRestriction();
             citizen.getLookControl().setLookAt(target, 10.0F, (float) citizen.getMaxHeadXRot());
@@ -603,30 +615,47 @@ public class FollowCommanderGoal extends Goal {
         // Validation navigation uniquement hors combat (pas de cible active)
         validateNavigation();
 
-        // ⑧ EATING volontaire — démarre quand sat ≤ 3, pas en combat.
-        // Appelle tryEatFood() une fois toutes les 40 ticks jusqu'à sat ≥ EATING_STOP.
+        // ⑧ EATING confort — libère la SM (anim native EATING) quand :
+        //   • guard dans la zone de confort (6–15 blocs du commandant)
+        //   • sat ≤ 50% (10/20) et pas en combat
+        boolean inComfortZone = distSq > COMFORT_NEAR_SQ && distSq <= COMFORT_FAR_SQ;
+        if (!isSmEating && inComfortZone && saturation <= SM_EAT_START) {
+            isSmEating = true;
+            restoreSM(); // libère la SM pour l'animation EATING native
+            citizen.getNavigation().stop();
+            LOG.debug("[CF:Guard#{}:{}] SM libérée pour EATING natif (sat={})",
+                    citizen.getId(), citizen.getName().getString(),
+                    String.format("%.1f", saturation));
+        }
+        if (isSmEating) {
+            // SM libre — on laisse MineColonies jouer l'animation et consommer la nourriture.
+            // On stoppe juste la navigation pour que le garde reste en place.
+            citizen.getNavigation().stop();
+            logMode(Mode.EATING, String.format("SM libre sat=%.1f", saturation));
+            return;
+        }
+
+        // ⑩ EATING famine — tryEatFood() manuel quand sat ≤ 3 (SM déjà figée).
         if (!isEating && saturation <= EATING_START) isEating = true;
 
         if (isEating) {
             enforceSMFreeze();
             citizen.getNavigation().stop();
             citizen.getLookControl().setLookAt(commander, 10.0F, (float) citizen.getMaxHeadXRot());
-            // Consomme activement — la SM figée ne peut pas traiter NEEDS_FOOD elle-même
             if (--eatCooldown <= 0) {
                 boolean ate = tryEatFood();
                 eatCooldown = ate ? 40 : 20;
                 if (!ate) {
-                    // Plus rien à manger — sort du mode eating pour reprendre le suivi
                     isEating = false;
                     LOG.debug("[CF:Guard#{}:{}] plus de nourriture en inventaire, sortie EATING",
                             citizen.getId(), citizen.getName().getString());
                 }
             }
-            logMode(Mode.EATING, String.format("sat=%.1f", saturation));
+            logMode(Mode.EATING, String.format("famine sat=%.1f", saturation));
             return;
         }
 
-        // ⑨ SUIVI / ZONE DE CONFORT
+        // ⑪ SUIVI / ZONE DE CONFORT
         enforceSMFreeze();
         citizen.getLookControl().setLookAt(commander, 10.0F, (float) citizen.getMaxHeadXRot());
 

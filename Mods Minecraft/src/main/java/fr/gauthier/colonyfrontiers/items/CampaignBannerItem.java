@@ -33,7 +33,7 @@ public class CampaignBannerItem extends Item {
                                 @NotNull TooltipFlag flag) {
         tooltip.add(Component.literal("").withStyle(ChatFormatting.GRAY));
 
-        tooltip.add(Component.literal("◆ Contrôle du régiment")
+        tooltip.add(Component.literal("◆ Recrutement")
                 .withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD));
 
         tooltip.add(Component.literal(" Clic droit ").withStyle(ChatFormatting.YELLOW)
@@ -41,7 +41,7 @@ public class CampaignBannerItem extends Item {
                         .withStyle(ChatFormatting.WHITE)));
 
         tooltip.add(Component.literal(" Shift + Clic droit ").withStyle(ChatFormatting.YELLOW)
-                .append(Component.literal("(vide) → Rassembler tous (30 blocs) / Dissoudre")
+                .append(Component.literal("(vide) → Rassembler (30 blocs) / Dissoudre")
                         .withStyle(ChatFormatting.WHITE)));
 
         tooltip.add(Component.literal("").withStyle(ChatFormatting.GRAY));
@@ -49,12 +49,16 @@ public class CampaignBannerItem extends Item {
         tooltip.add(Component.literal("◆ Ordres tactiques")
                 .withStyle(ChatFormatting.RED, ChatFormatting.BOLD));
 
-        tooltip.add(Component.literal(" Clic gauche ").withStyle(ChatFormatting.YELLOW)
+        tooltip.add(Component.literal(" Clic droit ").withStyle(ChatFormatting.YELLOW)
                 .append(Component.literal("sur un ennemi → Focus Fire sur cette cible")
                         .withStyle(ChatFormatting.WHITE)));
 
-        tooltip.add(Component.literal(" Shift + Clic gauche ").withStyle(ChatFormatting.YELLOW)
-                .append(Component.literal("sur un bloc → Poste de garde (toggle)")
+        tooltip.add(Component.literal(" Shift + Clic droit ").withStyle(ChatFormatting.YELLOW)
+                .append(Component.literal("sur un bloc → Poster les gardes")
+                        .withStyle(ChatFormatting.WHITE)));
+
+        tooltip.add(Component.literal(" Clic droit ").withStyle(ChatFormatting.YELLOW)
+                .append(Component.literal("sur un bloc → Rappeler les gardes postés")
                         .withStyle(ChatFormatting.WHITE)));
 
         tooltip.add(Component.literal("").withStyle(ChatFormatting.GRAY));
@@ -66,7 +70,7 @@ public class CampaignBannerItem extends Item {
                 .withStyle(ChatFormatting.GRAY));
         tooltip.add(Component.literal(" de flammes bleues au sol.")
                 .withStyle(ChatFormatting.GRAY));
-        tooltip.add(Component.literal(" Un garde affamé (faim = 0) ne peut pas combattre.")
+        tooltip.add(Component.literal(" La faim est réduite de 20× en campagne.")
                 .withStyle(ChatFormatting.GRAY));
 
         super.appendHoverText(stack, level, tooltip, flag);
