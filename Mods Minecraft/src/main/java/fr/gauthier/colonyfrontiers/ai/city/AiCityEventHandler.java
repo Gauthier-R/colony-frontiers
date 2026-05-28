@@ -9,6 +9,7 @@ import fr.gauthier.colonyfrontiers.events.GuardFollowEvent;
 import fr.gauthier.colonyfrontiers.util.CfLogger;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraftforge.event.level.ChunkEvent;
@@ -19,110 +20,181 @@ import net.minecraftforge.fml.common.Mod;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayDeque;
 import java.util.List;
-import java.util.Random;
+import java.util.Queue;
 
 /**
- * Orchestrateur principal du Module 1.
+ * Orchestrateur Module 1.
  *
- * WorldLoad     → log de l'état du registre.
- * ChunkLoad     → évaluation de région (spawn potentiel) + matérialisation des sites.
- * ServerTick    → boss respawn timer.
+ * RÈGLE FONDAMENTALE ANTI-DEADLOCK :
+ *   onChunkLoad ne fait JAMAIS d'appels lourds (createColony, getHeight sur chunks
+ *   non chargés, etc.). Il se contente d'enregistrer dans une file.
+ *   Toutes les opérations coûteuses se font dans onServerTick, une par tick.
+ *
+ *   Sans cette règle : createColony charge des chunks → onChunkLoad → createColony
+ *   → boucle infinie sur le thread serveur → freeze total.
  */
 @Mod.EventBusSubscriber(modid = ColonyFrontiers.MODID, bus = Mod.EventBusSubscriber.Bus.FORGE)
 public class AiCityEventHandler {
 
     private static final Logger LOG = LoggerFactory.getLogger("ColonyFrontiers/CityEvents");
 
-    /** Rayon en blocs pour déclencher la matérialisation d'un site réservé. */
-    private static final int MATERIALIZE_RADIUS = 300;
+    /** File des régions à évaluer (coordonnées de région, pas de bloc). */
+    private static final Queue<long[]> pendingRegions      = new ArrayDeque<>();
+    /** File des sites à matérialiser : (centre du site, UUID du joueur déclencheur). */
+    private static final Queue<long[]> pendingMaterialize = new ArrayDeque<>();
 
-    // ── CHARGEMENT DU MONDE ───────────────────────────────────────────────
+    /** Rayon en blocs pour déclencher la matérialisation. */
+    private static final int MATERIALIZE_RADIUS = 300;
+    /**
+     * Intervalle en ticks entre deux matérialisations.
+     * 200 ticks = 10 secondes — laisse le serveur respirer entre deux createColony.
+     */
+    private static final int MATERIALIZE_COOLDOWN = 200;
+    private static int materializeCooldown = 0;
+
+    // ── WORLD LOAD ────────────────────────────────────────────────────────
 
     @SubscribeEvent
     public static void onWorldLoad(LevelEvent.Load event) {
         if (!(event.getLevel() instanceof ServerLevel level)) return;
         if (!level.dimension().equals(net.minecraft.world.level.Level.OVERWORLD)) return;
 
-        AiCityRegistry registry = AiCityRegistry.get(level);
-        int cityCount   = registry.getCities().size();
-        long matCount   = registry.getCities().stream().filter(d -> d.colonyId != -1).count();
+        // Vide les files au cas où le serveur a redémarré sans décharger les statics
+        pendingRegions.clear();
+        pendingMaterialize.clear();
+        materializeCooldown = 0;
 
-        LOG.info("[CF:CityEvents] Monde chargé — {} cités ({} matérialisées)", cityCount, matCount);
-        CfLogger.log("WORLD_LOAD cities={} materialized={}", cityCount, matCount);
+        AiCityRegistry registry = AiCityRegistry.get(level);
+        long total = registry.getCities().size();
+        long mat   = registry.getCities().stream().filter(d -> d.colonyId != -1).count();
+
+        LOG.info("[CF:CityEvents] Monde chargé — {} cités ({} matérialisées)", total, mat);
+        CfLogger.log("WORLD_LOAD cities={} materialized={}", total, mat);
     }
 
-    // ── CHARGEMENT DE CHUNK ───────────────────────────────────────────────
-    // Deux responsabilités :
-    //   A) Évaluer la région du chunk si elle n'a jamais été vérifiée
-    //      → peut réserver un nouveau site (spawn IA)
-    //   B) Matérialiser les sites réservés proches (colonyId == -1)
-    //      → crée la colonie MineColonies réelle
+    // ── CHUNK LOAD — UNIQUEMENT des ajouts en file, RIEN de coûteux ──────
 
     @SubscribeEvent
     public static void onChunkLoad(ChunkEvent.Load event) {
         if (!(event.getLevel() instanceof ServerLevel level)) return;
         if (!level.dimension().equals(net.minecraft.world.level.Level.OVERWORLD)) return;
 
-        ChunkPos chunkPos   = event.getChunk().getPos();
-        BlockPos chunkCenter = chunkPos.getMiddleBlockPosition(64);
+        ChunkPos cp = event.getChunk().getPos();
+        BlockPos chunkCenter = cp.getMiddleBlockPosition(64);
 
         AiCityRegistry registry = AiCityRegistry.get(level);
 
-        // ── A) Évaluation de région ───────────────────────────────────────
+        // Évaluation de région — mise en file seulement
         int rX = AiCityRegistry.regionX(chunkCenter);
         int rZ = AiCityRegistry.regionZ(chunkCenter);
-
         if (!registry.isRegionChecked(rX, rZ)) {
-            AiCitySpawner.evaluateRegion(level, registry, rX, rZ);
+            // Marque immédiatement pour éviter les doublons dans la file
+            registry.markRegionChecked(rX, rZ);
+            pendingRegions.offer(new long[]{ rX, rZ });
         }
 
-        // ── B) Matérialisation des sites proches ──────────────────────────
-        // On ne matérialise que si un joueur est dans le rayon (on n'utilise
-        // plus de joueur comme propriétaire, mais on attend qu'il soit là pour
-        // que les chunks soient bien chargés et le spawn sûr).
+        // Matérialisation — mise en file seulement si un joueur est proche
         List<Player> nearbyPlayers = level.getEntitiesOfClass(Player.class,
                 new net.minecraft.world.phys.AABB(
                         chunkCenter.offset(-MATERIALIZE_RADIUS, -64, -MATERIALIZE_RADIUS),
                         chunkCenter.offset( MATERIALIZE_RADIUS,  64,  MATERIALIZE_RADIUS)));
         if (nearbyPlayers.isEmpty()) return;
 
+        // Stocke le UUID du joueur le plus proche pour le passer à createColony
+        Player closest = nearbyPlayers.get(0);
+        long playerUuidMost  = closest.getUUID().getMostSignificantBits();
+        long playerUuidLeast = closest.getUUID().getLeastSignificantBits();
+
         for (AiCityData data : registry.getCities()) {
-            if (data.colonyId != -1) continue; // déjà matérialisée
+            if (data.colonyId != -1) continue;
             if (data.center.distSqr(chunkCenter) > (long) MATERIALIZE_RADIUS * MATERIALIZE_RADIUS) continue;
-
-            AiCitySpawner.materializeColony(level, data, registry);
-        }
-
-        // ── C) Catchup hybride pour cités déjà matérialisées ─────────────
-        for (AiCityData data : registry.getCities()) {
-            if (data.colonyId == -1) continue;
-            if (data.center.distSqr(chunkCenter) > (long) MATERIALIZE_RADIUS * MATERIALIZE_RADIUS) continue;
-
-            IColony colony = IMinecoloniesAPI.getInstance().getColonyManager()
-                    .getColonyByWorld(data.colonyId, level);
-            if (colony == null) continue;
-
-            HybridEvolutionEngine.triggerOnlineCatchup(level, data, colony);
-            registry.setDirty();
+            // Clé unique = coordonnées du centre packed
+            long key = ((long) data.center.getX() << 32) | (data.center.getZ() & 0xFFFFFFFFL);
+            boolean alreadyQueued = pendingMaterialize.stream()
+                    .anyMatch(e -> e[0] == key);
+            if (!alreadyQueued) {
+                pendingMaterialize.offer(new long[]{ key, playerUuidMost, playerUuidLeast });
+            }
         }
     }
 
-    // ── SERVER TICK — boss respawn ────────────────────────────────────────
+    // ── SERVER TICK — traitement des files, UNE opération par tick ────────
 
     @SubscribeEvent
     public static void onServerTick(TickEvent.ServerTickEvent event) {
         if (event.phase != TickEvent.Phase.END) return;
 
-        ServerLevel overworld = event.getServer().getLevel(net.minecraft.world.level.Level.OVERWORLD);
+        ServerLevel overworld = event.getServer()
+                .getLevel(net.minecraft.world.level.Level.OVERWORLD);
         if (overworld == null) return;
 
         AiCityRegistry registry = AiCityRegistry.get(overworld);
 
+        // Traite une évaluation de région par tick
+        if (!pendingRegions.isEmpty()) {
+            long[] region = pendingRegions.poll();
+            try {
+                AiCitySpawner.evaluateRegion(overworld, registry, (int) region[0], (int) region[1]);
+            } catch (Exception e) {
+                LOG.error("[CF:CityEvents] evaluateRegion échoué: {}", e.getMessage());
+                CfLogger.log("EVALUATE_ERROR region=({},{}) err={}", region[0], region[1], e.getMessage());
+            }
+            return; // Une seule opération par tick
+        }
+
+        // Traite une matérialisation si le cooldown est écoulé
+        if (materializeCooldown > 0) {
+            materializeCooldown--;
+            return;
+        }
+
+        if (!pendingMaterialize.isEmpty()) {
+            long[] entry = pendingMaterialize.poll();
+            long key             = entry[0];
+            java.util.UUID playerUuid = new java.util.UUID(entry[1], entry[2]);
+
+            // Retrouve le AiCityData via la clé (x << 32 | z)
+            AiCityData data = null;
+            for (AiCityData d : registry.getCities()) {
+                if (d.colonyId != -1) continue;
+                long dk = ((long) d.center.getX() << 32) | (d.center.getZ() & 0xFFFFFFFFL);
+                if (dk == key) { data = d; break; }
+            }
+
+            if (data != null) {
+                // Retrouve le joueur déclencheur — doit encore être connecté
+                net.minecraft.server.level.ServerPlayer player =
+                        overworld.getServer().getPlayerList().getPlayer(playerUuid);
+                if (player == null) {
+                    // Joueur déconnecté — remet en file avec le premier joueur dispo
+                    List<net.minecraft.server.level.ServerPlayer> online =
+                            overworld.getServer().getPlayerList().getPlayers();
+                    if (!online.isEmpty()) {
+                        player = online.get(0);
+                    }
+                }
+                if (player != null) {
+                    try {
+                        AiCitySpawner.materializeColony(overworld, data, player, registry);
+                    } catch (Exception e) {
+                        LOG.error("[CF:CityEvents] materializeColony échoué: {}", e.getMessage());
+                        CfLogger.log("MATERIALIZE_EXCEPTION pos={} err={}",
+                                data.center, e.getMessage());
+                    }
+                } else {
+                    LOG.debug("[CF:CityEvents] aucun joueur connecté pour matérialiser {}", data.center);
+                }
+                materializeCooldown = MATERIALIZE_COOLDOWN;
+            }
+            return;
+        }
+
+        // Boss respawn timer
         for (AiCityData data : registry.getCities()) {
             if (data.bossRespawnTicks <= 0) continue;
             if (!isPlayerNearby(overworld, data.center, 512)) continue;
-
             data.bossRespawnTicks--;
             if (data.bossRespawnTicks == 0) {
                 IColony colony = IMinecoloniesAPI.getInstance().getColonyManager()
@@ -149,8 +221,7 @@ public class AiCityEventHandler {
             .ifPresent(c -> {
                 BossSystem.markBoss(c, data.colonyId);
                 data.bossDefeated = false;
-                LOG.info("[CF:CityEvents] nouveau boss promu colonyId={} citizenId={}",
-                        data.colonyId, c.getId());
+                LOG.info("[CF:CityEvents] boss promu colonyId={} citizenId={}", data.colonyId, c.getId());
                 CfLogger.log("BOSS_PROMOTED colonyId={} citizenId={}", data.colonyId, c.getId());
             });
     }

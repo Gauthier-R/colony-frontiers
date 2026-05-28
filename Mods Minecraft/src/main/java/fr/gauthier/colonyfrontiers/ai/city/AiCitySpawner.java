@@ -6,6 +6,7 @@ import com.minecolonies.api.colony.IColonyManager;
 import fr.gauthier.colonyfrontiers.util.CfLogger;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.Heightmap;
 import org.slf4j.Logger;
@@ -103,7 +104,7 @@ public class AiCitySpawner {
      * Les chunks autour du site doivent être chargés (appelé quand un joueur est à proximité).
      */
     public static void materializeColony(ServerLevel level, AiCityData data,
-                                          AiCityRegistry registry) {
+                                          ServerPlayer player, AiCityRegistry registry) {
         // Cherche la vraie surface autour du centre XZ réservé
         BlockPos surface = findBestSurface(level, data.center.getX(), data.center.getZ(),
                 SURFACE_SEARCH_R);
@@ -133,9 +134,9 @@ public class AiCitySpawner {
 
         IColony colony;
         try {
-            // player=null → MineColonies assigne UUID nil (0,0) comme propriétaire.
-            // Aucun joueur réel n'est propriétaire de la colonie.
-            colony = mgr.createColony(level, surface, null, colonyName, stylePack);
+            // On passe un joueur réel pour éviter le NPE interne de MineColonies.
+            // Le joueur est retiré des permissions après création (voir ci-dessous).
+            colony = mgr.createColony(level, surface, player, colonyName, stylePack);
         } catch (Exception e) {
             LOG.error("[CF:Spawner] createColony échoué en {}: {}", surface, e.getMessage());
             CfLogger.log("MATERIALIZE_ERROR pos={} err={}", surface, e.getMessage());
@@ -149,6 +150,18 @@ public class AiCitySpawner {
         }
 
         colony.setStructurePack(stylePack);
+
+        // Retire le joueur déclencheur des permissions — la colonie IA n'appartient à personne.
+        // On le retire de la liste des membres et on le reclasse HOSTILE.
+        try {
+            colony.getPermissions().setPlayerRank(
+                    player.getUUID(),
+                    colony.getPermissions().getRankHostile(),
+                    level);
+        } catch (Exception e) {
+            LOG.warn("[CF:Spawner] setPlayerRank hostile échoué (non bloquant): {}", e.getMessage());
+        }
+
         data.colonyId          = colony.getID();
         data.lastEvolutionTick = level.getGameTime();
         registry.setDirty();
