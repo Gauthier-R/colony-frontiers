@@ -9,35 +9,37 @@ import net.minecraft.world.level.saveddata.SavedData;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
+import java.util.*;
 
 /**
- * Registre persistant de toutes les cités IA (GDD Module 1).
+ * Registre persistant de toutes les cités IA.
  *
- * Stocké via SavedData dans le niveau Overworld sous la clé "colonyfrontiers_cities".
- * Persiste à travers les redémarrages serveur.
+ * Stocké via SavedData sous la clé "colonyfrontiers_cities".
  *
- * Usage :
- *   AiCityRegistry reg = AiCityRegistry.get(serverLevel);
- *   reg.addCity(data);
- *   reg.setDirty();
+ * Système de régions (comme les villages vanilla) :
+ *   Le monde est découpé en régions carrées de REGION_SIZE × REGION_SIZE blocs.
+ *   Chaque région est identifiée par (regionX, regionZ) = (blockX / REGION_SIZE, blockZ / REGION_SIZE).
+ *   Quand un joueur charge des chunks dans une région non encore vérifiée,
+ *   AiCitySpawner tente (avec SPAWN_CHANCE de probabilité) de placer une cité.
+ *   La région est ensuite marquée "vérifiée" pour ne plus être tentée.
+ *   → Résultat : distribution infinie et homogène, identique aux villages vanilla.
  */
 public class AiCityRegistry extends SavedData {
 
     private static final Logger LOG       = LoggerFactory.getLogger("ColonyFrontiers/Registry");
     private static final String DATA_NAME = "colonyfrontiers_cities";
 
-    /** Intervalle entre deux tentatives de spawn dynamique (en ticks). 20 min réelles. */
-    public static final int SPAWN_INTERVAL_TICKS = 20 * 60 * 20;
+    /** Taille d'une région en blocs. Une cité max par région. */
+    public static final int REGION_SIZE = 2048;
 
-    private final List<AiCityData> cities     = new ArrayList<>();
-    private int                    spawnTimer = SPAWN_INTERVAL_TICKS;
-    /** Vrai si la génération initiale au premier chargement a déjà eu lieu. */
-    private boolean                worldGenDone = false;
+    /** Probabilité qu'une région contienne une cité (0.0–1.0). */
+    public static final float SPAWN_CHANCE = 0.60f;
 
-    // ── ACCÈS SINGLETON PAR NIVEAU ────────────────────────────────────────
+    private final List<AiCityData>  cities         = new ArrayList<>();
+    /** Régions déjà évaluées — stocké comme paires long (regionX << 32 | regionZ). */
+    private final Set<Long>         checkedRegions = new HashSet<>();
+
+    // ── ACCÈS SINGLETON ──────────────────────────────────────────────────
 
     public static AiCityRegistry get(ServerLevel overworld) {
         return overworld.getDataStorage().computeIfAbsent(
@@ -46,7 +48,30 @@ public class AiCityRegistry extends SavedData {
                 DATA_NAME);
     }
 
-    // ── API PUBLIQUE ──────────────────────────────────────────────────────
+    // ── RÉGIONS ───────────────────────────────────────────────────────────
+
+    public static long regionKey(int regionX, int regionZ) {
+        return ((long) regionX << 32) | (regionZ & 0xFFFFFFFFL);
+    }
+
+    public static int regionX(BlockPos pos) {
+        return Math.floorDiv(pos.getX(), REGION_SIZE);
+    }
+
+    public static int regionZ(BlockPos pos) {
+        return Math.floorDiv(pos.getZ(), REGION_SIZE);
+    }
+
+    public boolean isRegionChecked(int regionX, int regionZ) {
+        return checkedRegions.contains(regionKey(regionX, regionZ));
+    }
+
+    public void markRegionChecked(int regionX, int regionZ) {
+        checkedRegions.add(regionKey(regionX, regionZ));
+        setDirty();
+    }
+
+    // ── CITÉS ─────────────────────────────────────────────────────────────
 
     public List<AiCityData> getCities() {
         return Collections.unmodifiableList(cities);
@@ -55,8 +80,8 @@ public class AiCityRegistry extends SavedData {
     public void addCity(AiCityData data) {
         cities.add(data);
         setDirty();
-        LOG.info("[CF:Registry] cité ajoutée center={} archetype={} tier={}",
-                data.center, data.archetype, data.currentTier);
+        LOG.info("[CF:Registry] cité enregistrée center={} archetype={} tier={} colonyId={}",
+                data.center, data.archetype, data.currentTier, data.colonyId);
     }
 
     public void removeCity(AiCityData data) {
@@ -64,32 +89,8 @@ public class AiCityRegistry extends SavedData {
         setDirty();
     }
 
-    public boolean isWorldGenDone() { return worldGenDone; }
-    public void markWorldGenDone()  { worldGenDone = true; setDirty(); }
-
-    public int getSpawnTimer()                { return spawnTimer; }
-    public void setSpawnTimer(int t)          { spawnTimer = t; setDirty(); }
-    public void decrementSpawnTimer()         { spawnTimer = Math.max(0, spawnTimer - 1); setDirty(); }
-
-    /**
-     * Retourne la cité dont le Town Hall est le plus proche de pos,
-     * ou null si aucune cité n'existe.
-     */
-    public AiCityData getClosest(BlockPos pos) {
-        AiCityData best = null;
-        double bestDist = Double.MAX_VALUE;
-        for (AiCityData d : cities) {
-            double dist = d.center.distSqr(pos);
-            if (dist < bestDist) { bestDist = dist; best = d; }
-        }
-        return best;
-    }
-
-    /**
-     * Vérifie qu'aucune cité existante n'est à moins de minDistBlocks du point donné.
-     */
     public boolean isFarEnoughFromAll(BlockPos pos, int minDistBlocks) {
-        int minSq = minDistBlocks * minDistBlocks;
+        long minSq = (long) minDistBlocks * minDistBlocks;
         for (AiCityData d : cities) {
             if (d.center.distSqr(pos) < minSq) return false;
         }
@@ -103,6 +104,16 @@ public class AiCityRegistry extends SavedData {
         return null;
     }
 
+    public AiCityData getClosest(BlockPos pos) {
+        AiCityData best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (AiCityData d : cities) {
+            double dist = d.center.distSqr(pos);
+            if (dist < bestDist) { bestDist = dist; best = d; }
+        }
+        return best;
+    }
+
     // ── NBT ──────────────────────────────────────────────────────────────
 
     @Override
@@ -110,8 +121,11 @@ public class AiCityRegistry extends SavedData {
         ListTag list = new ListTag();
         for (AiCityData d : cities) list.add(d.save());
         tag.put("cities", list);
-        tag.putInt("spawnTimer",   spawnTimer);
-        tag.putBoolean("worldGenDone", worldGenDone);
+
+        long[] regions = new long[checkedRegions.size()];
+        int i = 0;
+        for (long r : checkedRegions) regions[i++] = r;
+        tag.putLongArray("checkedRegions", regions);
         return tag;
     }
 
@@ -121,9 +135,9 @@ public class AiCityRegistry extends SavedData {
         for (int i = 0; i < list.size(); i++) {
             reg.cities.add(AiCityData.load(list.getCompound(i)));
         }
-        reg.spawnTimer   = tag.getInt("spawnTimer");
-        reg.worldGenDone = tag.getBoolean("worldGenDone");
-        LOG.info("[CF:Registry] chargé — {} cités", reg.cities.size());
+        for (long r : tag.getLongArray("checkedRegions")) reg.checkedRegions.add(r);
+        LOG.info("[CF:Registry] chargé — {} cités, {} régions vérifiées",
+                reg.cities.size(), reg.checkedRegions.size());
         return reg;
     }
 }

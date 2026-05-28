@@ -3,180 +3,168 @@ package fr.gauthier.colonyfrontiers.ai.city;
 import com.minecolonies.api.IMinecoloniesAPI;
 import com.minecolonies.api.colony.IColony;
 import com.minecolonies.api.colony.IColonyManager;
+import fr.gauthier.colonyfrontiers.util.CfLogger;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.levelgen.Heightmap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Random;
 
 /**
- * Génération et placement de cités IA (GDD Module 1).
+ * Placement des cités IA (GDD Module 1).
  *
- * Responsabilités :
- *  1. Trouver une position valide (>1500 blocs de toute colonie, terrain plat).
- *  2. Créer la colonie MineColonies sous-jacente.
- *  3. Enregistrer l'AiCityData dans l'AiCityRegistry.
- *  4. Confier l'évolution initiale à HybridEvolutionEngine.
+ * Distribution infinie par grille de régions :
+ *   Quand un joueur entre dans une région de REGION_SIZE blocs non encore évaluée,
+ *   on choisit un point aléatoire dans cette région et on tente d'y placer une cité.
+ *   La région est marquée "évaluée" qu'il y ait une cité ou non.
+ *   → Identique au comportement des villages vanilla : distribution infinie et homogène.
+ *
+ * Propriété :
+ *   Les colonies IA ne sont la propriété d'aucun joueur.
+ *   Elles sont créées via un UUID fixe réservé [CF-AI] qui ne correspond à aucun compte.
+ *   MineColonies stocke cet UUID comme "owner" mais aucun joueur ne le reçoit jamais.
  */
 public class AiCitySpawner {
 
     private static final Logger LOG = LoggerFactory.getLogger("ColonyFrontiers/Spawner");
 
-    private static final int MIN_COLONY_DIST   = 1500;  // blocs
-    private static final int FLATNESS_RADIUS   = 8;     // blocs XZ vérifiés
-    private static final int MAX_HEIGHT_DELTA  = 3;     // variation de Y tolérée
-    private static final int MAX_SEARCH_TRIES  = 64;    // tentatives de placement
-    private static final int SEARCH_RANGE      = 3000;  // rayon de recherche autour de l'origine
-    private static final int WORLD_GEN_CITIES  = 5;     // cités pré-générées au premier chargement
-
-    // ── GÉNÉRATION INITIALE DU MONDE ─────────────────────────────────────
+    private static final int   FLATNESS_RADIUS  = 8;   // blocs XZ vérifiés autour du centre
+    private static final int   MAX_HEIGHT_DELTA = 3;   // variation Y tolérée
+    private static final int   MAX_SEARCH_TRIES = 32;  // tentatives dans la région
+    private static final int   MIN_CITY_DIST    = 800; // distance min entre deux cités IA
 
     /**
-     * Appelé une seule fois lors du premier chargement du monde.
-     * Génère WORLD_GEN_CITIES cités avec des tiers aléatoires (1–4).
+     * Évalue une région : choisit un point et tente d'y placer une cité.
+     * Appelé par AiCityEventHandler quand un joueur entre dans une région non vérifiée.
+     *
+     * @param regionX  coordonnée de région X (blockX / REGION_SIZE)
+     * @param regionZ  coordonnée de région Z (blockZ / REGION_SIZE)
      */
-    public static void generateInitialCities(ServerLevel level, AiCityRegistry registry, Random rng) {
-        LOG.info("[CF:Spawner] Génération initiale — {} cités demandées", WORLD_GEN_CITIES);
-        int spawned = 0;
-        for (int attempt = 0; attempt < WORLD_GEN_CITIES * 4 && spawned < WORLD_GEN_CITIES; attempt++) {
-            int tier = 1 + rng.nextInt(4); // 1–4
-            if (trySpawnCity(level, registry, rng, tier)) spawned++;
+    public static void evaluateRegion(ServerLevel level, AiCityRegistry registry,
+                                       int regionX, int regionZ) {
+        // Graine déterministe : même région = même résultat sur tout serveur avec même world seed
+        long seed = level.getSeed() ^ ((long) regionX * 0x9E3779B97F4A7C15L)
+                                    ^ ((long) regionZ * 0x6C62272E07BB0142L);
+        Random rng = new Random(seed);
+
+        // Marque la région comme évaluée immédiatement pour éviter les doubles tentatives
+        registry.markRegionChecked(regionX, regionZ);
+
+        if (rng.nextFloat() > AiCityRegistry.SPAWN_CHANCE) {
+            LOG.debug("[CF:Spawner] région ({},{}) — pas de cité (tirage négatif)", regionX, regionZ);
+            CfLogger.log("REGION_SKIP ({},{}) seed={}", regionX, regionZ, seed);
+            return;
         }
-        LOG.info("[CF:Spawner] Génération initiale terminée — {} cités créées", spawned);
-        registry.markWorldGenDone();
-    }
 
-    // ── SPAWN DYNAMIQUE ───────────────────────────────────────────────────
+        // Cherche une position valide dans la région
+        int baseX = regionX * AiCityRegistry.REGION_SIZE;
+        int baseZ = regionZ * AiCityRegistry.REGION_SIZE;
 
-    /**
-     * Tentative de spawn d'une nouvelle cité Tier 1 pendant le gameplay.
-     * Appelé par AiCityEventHandler lors du tick du spawn timer.
-     */
-    public static void trySpawnDynamicCity(ServerLevel level, AiCityRegistry registry, Random rng) {
-        LOG.info("[CF:Spawner] Tentative de spawn dynamique...");
-        trySpawnCity(level, registry, rng, 1);
-    }
+        for (int attempt = 0; attempt < MAX_SEARCH_TRIES; attempt++) {
+            int x = baseX + rng.nextInt(AiCityRegistry.REGION_SIZE);
+            int z = baseZ + rng.nextInt(AiCityRegistry.REGION_SIZE);
 
-    // ── LOGIQUE CENTRALE ──────────────────────────────────────────────────
-
-    private static boolean trySpawnCity(ServerLevel level, AiCityRegistry registry,
-                                        Random rng, int tier) {
-        for (int i = 0; i < MAX_SEARCH_TRIES; i++) {
-            int x = (rng.nextInt(SEARCH_RANGE * 2) - SEARCH_RANGE);
-            int z = (rng.nextInt(SEARCH_RANGE * 2) - SEARCH_RANGE);
             BlockPos candidate = findSurfacePos(level, x, z);
             if (candidate == null) continue;
-
-            // Distance à toutes les colonies MineColonies existantes
-            if (!isFarEnoughFromAllColonies(level, candidate)) continue;
-
-            // Distance aux cités IA déjà enregistrées
-            if (!registry.isFarEnoughFromAll(candidate, MIN_COLONY_DIST)) continue;
-
-            // Vérification de la planéité du terrain
+            if (!registry.isFarEnoughFromAll(candidate, MIN_CITY_DIST)) continue;
             if (!isFlatEnough(level, candidate)) continue;
 
-            // Tout est bon — créer la cité
-            return spawnCityAt(level, registry, rng, candidate, tier);
+            // Position valide — enregistre la cité sans créer encore la colonie MC
+            // (la colonie sera créée quand un joueur sera physiquement à portée)
+            AiColonyArchetype archetype = AiColonyArchetype.random(rng);
+            int tier = 1 + rng.nextInt(4);
+
+            AiCityData data = new AiCityData(candidate, archetype, tier);
+            data.colonyId          = -1; // colonie MC pas encore créée
+            data.lastEvolutionTick = level.getGameTime();
+            registry.addCity(data);
+
+            LOG.info("[CF:Spawner] SITE RÉSERVÉ pos={} tier={} archetype={} région=({},{})",
+                    candidate, tier, archetype, regionX, regionZ);
+            CfLogger.log("SITE_RESERVED pos={} tier={} archetype={} region=({},{})",
+                    candidate, tier, archetype, regionX, regionZ);
+            return;
         }
-        LOG.warn("[CF:Spawner] Impossible de trouver une position valide après {} essais",
-                MAX_SEARCH_TRIES);
-        return false;
+
+        LOG.warn("[CF:Spawner] région ({},{}) — aucune position valide après {} essais",
+                regionX, regionZ, MAX_SEARCH_TRIES);
+        CfLogger.log("REGION_NO_VALID_POS ({},{}) after {} tries", regionX, regionZ, MAX_SEARCH_TRIES);
     }
 
-    // ── CRÉATION DE LA COLONIE ────────────────────────────────────────────
-
-    private static boolean spawnCityAt(ServerLevel level, AiCityRegistry registry,
-                                       Random rng, BlockPos pos, int tier) {
+    /**
+     * Crée la colonie MineColonies pour un site réservé (colonyId == -1).
+     * Utilise un UUID propriétaire fixe [CF-AI] — aucun joueur réel n'est propriétaire.
+     * Appelé quand un joueur entre dans le rayon de matérialisation.
+     */
+    public static void materializeColony(ServerLevel level, AiCityData data,
+                                          AiCityRegistry registry) {
         IColonyManager mgr = IMinecoloniesAPI.getInstance().getColonyManager();
 
-        // Sécurité finale — MineColonies vérifie aussi la distance
-        if (!mgr.isFarEnoughFromColonies(level, pos)) {
-            LOG.warn("[CF:Spawner] MineColonies refuse le placement en {}", pos);
-            return false;
+        if (!mgr.isFarEnoughFromColonies(level, data.center)) {
+            LOG.warn("[CF:Spawner] matérialisation refusée par MC en {} — site supprimé", data.center);
+            CfLogger.log("MATERIALIZE_REFUSED pos={} — removed", data.center);
+            registry.removeCity(data);
+            return;
         }
 
-        // Détermine style et archétype
-        String structurePack = BiomeStyleMapper.getStyleFor(level, pos);
-        AiColonyArchetype archetype = AiColonyArchetype.random(rng);
+        String stylePack = BiomeStyleMapper.getStyleFor(level, data.center);
+        String colonyName = "IA_" + data.archetype.name()
+                + "_" + data.center.getX() + "_" + data.center.getZ();
 
-        // Créer la colonie MineColonies (owner=null = colonie sans joueur)
+        // Crée la colonie sans joueur propriétaire réel.
+        // MineColonies accepte null comme player dans createColony — l'owner UUID
+        // sera UUID(0,0) (nil UUID) ce qui ne correspond à aucun compte joueur.
         IColony colony;
         try {
-            colony = mgr.createColony(level, pos, null,
-                    "IA_" + archetype.name() + "_" + pos.getX() + "_" + pos.getZ(),
-                    structurePack);
+            colony = mgr.createColony(level, data.center, null, colonyName, stylePack);
         } catch (Exception e) {
-            LOG.error("[CF:Spawner] Erreur lors de la création de la colonie en {}: {}", pos, e.getMessage());
-            return false;
+            LOG.error("[CF:Spawner] createColony échoué en {}: {}", data.center, e.getMessage());
+            CfLogger.log("MATERIALIZE_ERROR pos={} error={}", data.center, e.getMessage());
+            return;
         }
 
         if (colony == null) {
-            LOG.warn("[CF:Spawner] createColony a retourné null en {}", pos);
-            return false;
+            LOG.warn("[CF:Spawner] createColony retourné null en {}", data.center);
+            return;
         }
 
-        colony.setStructurePack(structurePack);
-
-        // Enregistrer la cité
-        AiCityData data = new AiCityData(pos, archetype, tier);
-        data.colonyId          = colony.getID();
+        colony.setStructurePack(stylePack);
+        data.colonyId = colony.getID();
         data.lastEvolutionTick = level.getGameTime();
-        registry.addCity(data);
+        registry.setDirty();
 
-        // Évolution initiale selon le tier
+        // Applique l'évolution initiale basée sur le tier
         HybridEvolutionEngine.applyOfflineProgress(level, data, colony);
 
         LOG.info("[CF:Spawner] CITÉ CRÉÉE colonyId={} pos={} tier={} archetype={} style={}",
-                colony.getID(), pos, tier, archetype, structurePack);
-        return true;
+                colony.getID(), data.center, data.currentTier, data.archetype, stylePack);
+        CfLogger.log("CITY_CREATED colonyId={} pos={} tier={} archetype={} style={}",
+                colony.getID(), data.center, data.currentTier, data.archetype, stylePack);
     }
 
     // ── HELPERS TERRAIN ───────────────────────────────────────────────────
 
-    /**
-     * Trouve la position de surface solide à (x, z).
-     * Retourne null si la colonne est toute en liquide ou en air.
-     */
     static BlockPos findSurfacePos(ServerLevel level, int x, int z) {
-        int y = level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.WORLD_SURFACE_WG, x, z);
+        int y = level.getHeight(Heightmap.Types.WORLD_SURFACE_WG, x, z);
         if (y <= level.getMinBuildHeight()) return null;
         BlockPos pos = new BlockPos(x, y, z);
-        BlockState state = level.getBlockState(pos.below());
-        if (state.liquid() || state.isAir()) return null;
+        BlockState below = level.getBlockState(pos.below());
+        if (below.liquid() || below.isAir()) return null;
         return pos;
     }
 
-    /**
-     * Vérifie que le terrain est suffisamment plat dans un carré de FLATNESS_RADIUS blocs.
-     * La variation maximale de hauteur autorisée est MAX_HEIGHT_DELTA.
-     */
     static boolean isFlatEnough(ServerLevel level, BlockPos center) {
         int baseY = center.getY();
         for (int dx = -FLATNESS_RADIUS; dx <= FLATNESS_RADIUS; dx += 2) {
             for (int dz = -FLATNESS_RADIUS; dz <= FLATNESS_RADIUS; dz += 2) {
-                int y = level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.WORLD_SURFACE_WG,
+                int y = level.getHeight(Heightmap.Types.WORLD_SURFACE_WG,
                         center.getX() + dx, center.getZ() + dz);
                 if (Math.abs(y - baseY) > MAX_HEIGHT_DELTA) return false;
             }
         }
         return true;
-    }
-
-    /**
-     * Vérifie la distance minimale par rapport à toutes les colonies MineColonies existantes.
-     */
-    static boolean isFarEnoughFromAllColonies(ServerLevel level, BlockPos pos) {
-        IColonyManager mgr = IMinecoloniesAPI.getInstance().getColonyManager();
-        // isFarEnoughFromColonies utilise en interne la distance configurée dans MineColonies,
-        // qui est typiquement 512 blocs. On vérifie également notre propre seuil plus strict.
-        if (!mgr.isFarEnoughFromColonies(level, pos)) return false;
-
-        // Vérification supplémentaire avec MIN_COLONY_DIST
-        IColony closest = mgr.getClosestColony(level, pos);
-        if (closest == null) return true;
-        return Math.sqrt(closest.getCenter().distSqr(pos)) >= MIN_COLONY_DIST;
     }
 }

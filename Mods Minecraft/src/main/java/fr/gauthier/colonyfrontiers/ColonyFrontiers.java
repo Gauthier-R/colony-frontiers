@@ -2,6 +2,8 @@ package fr.gauthier.colonyfrontiers;
 
 
 import fr.gauthier.colonyfrontiers.init.ModItems;
+import fr.gauthier.colonyfrontiers.util.CfLogger;
+import net.minecraftforge.fml.loading.FMLPaths;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -19,6 +21,7 @@ public class ColonyFrontiers {
 
     public ColonyFrontiers() {
         IEventBus modEventBus = FMLJavaModLoadingContext.get().getModEventBus();
+        CfLogger.init(FMLPaths.GAMEDIR.get());
         ModItems.ITEMS.register(modEventBus);
         modEventBus.addListener(this::commonSetup);
         modEventBus.addListener(this::buildCreativeModeTab);
