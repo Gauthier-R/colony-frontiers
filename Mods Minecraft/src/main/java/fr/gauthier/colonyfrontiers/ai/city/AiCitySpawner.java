@@ -15,42 +15,27 @@ import org.slf4j.LoggerFactory;
 import java.util.Random;
 
 /**
- * Placement des cités IA — deux phases distinctes :
+ * Placement des cités IA — deux phases.
  *
- * Phase 1 — RÉSERVATION (evaluateRegion)
- *   Déclenchée dès qu'un chunk d'une région inconnue est chargé.
- *   Choisit une position XZ déterministe dans la région (graine = world seed × région).
- *   Aucune lecture de heightmap, aucun chunk ne doit être chargé.
- *   → Résultat immédiat, zéro risque de NullPointerException.
+ * Phase 1 (evaluateRegion) : réservation XZ instantanée, sans lecture terrain.
+ * Phase 2 (materializeColony) : surface valide + biome sain + création colonie MC.
  *
- * Phase 2 — MATÉRIALISATION (materializeColony)
- *   Déclenchée quand un joueur entre dans le rayon de MATERIALIZE_RADIUS blocs du site.
- *   À ce moment les chunks sont chargés → on peut lire le terrain.
- *   Cherche la vraie surface, vérifie la planéité, crée la colonie MineColonies.
- *   La colonie est créée sans joueur propriétaire réel (player=null → UUID nil).
+ * Rejet de biome : océan, rivière, glace, nether → null → site rejeté ou déplacé.
+ * Planéité : écart Y max 4 blocs sur rayon 8.
  */
 public class AiCitySpawner {
 
     private static final Logger LOG = LoggerFactory.getLogger("ColonyFrontiers/Spawner");
 
-    /** Distance minimum entre deux cités IA (blocs). */
-    private static final int MIN_CITY_DIST     = 600;
-    /** Rayon de recherche de surface autour du centre réservé lors de la matérialisation. */
-    private static final int SURFACE_SEARCH_R  = 64;
-    /** Variation de hauteur maximale tolérée pour la planéité (blocs). */
-    private static final int MAX_HEIGHT_DELTA  = 4;
-    /** Rayon de vérification de planéité (blocs). */
-    private static final int FLATNESS_RADIUS   = 8;
+    private static final int MIN_CITY_DIST    = 600;
+    private static final int SURFACE_SEARCH_R = 96;
+    private static final int MAX_HEIGHT_DELTA = 4;
+    private static final int FLATNESS_RADIUS  = 8;
 
     // ── PHASE 1 : RÉSERVATION ─────────────────────────────────────────────
 
-    /**
-     * Évalue une région et réserve éventuellement un site.
-     * Ne lit JAMAIS le terrain — peut être appelée sur n'importe quel chunk.
-     */
     public static void evaluateRegion(ServerLevel level, AiCityRegistry registry,
                                        int regionX, int regionZ) {
-        // Graine déterministe — même résultat sur tout serveur avec la même world seed
         long seed = level.getSeed()
                 ^ ((long) regionX * 0x9E3779B97F4A7C15L)
                 ^ ((long) regionZ * 0x6C62272E07BB0142L);
@@ -58,25 +43,19 @@ public class AiCitySpawner {
 
         registry.markRegionChecked(regionX, regionZ);
 
-        // Roll de spawn
         if (rng.nextFloat() > AiCityRegistry.SPAWN_CHANCE) {
             LOG.debug("[CF:Spawner] région ({},{}) — tirage négatif", regionX, regionZ);
-            CfLogger.log("REGION_SKIP ({},{}) seed={}", regionX, regionZ, seed);
+            CfLogger.log("REGION_SKIP ({},{})", regionX, regionZ);
             return;
         }
 
-        // Position XZ dans la moitié centrale de la région (évite les bords)
         int quarter = AiCityRegistry.REGION_SIZE / 4;
         int half    = AiCityRegistry.REGION_SIZE / 2;
-        int baseX   = regionX * AiCityRegistry.REGION_SIZE;
-        int baseZ   = regionZ * AiCityRegistry.REGION_SIZE;
-        int x = baseX + quarter + rng.nextInt(half);
-        int z = baseZ + quarter + rng.nextInt(half);
+        int x = regionX * AiCityRegistry.REGION_SIZE + quarter + rng.nextInt(half);
+        int z = regionZ * AiCityRegistry.REGION_SIZE + quarter + rng.nextInt(half);
 
-        // Y=64 provisoire — sera mis à jour lors de la matérialisation
         BlockPos candidate = new BlockPos(x, 64, z);
 
-        // Distance aux cités déjà réservées/créées (comparaison XZ uniquement, Y=64 partout)
         if (!registry.isFarEnoughFromAll(candidate, MIN_CITY_DIST)) {
             LOG.debug("[CF:Spawner] région ({},{}) — trop proche d'un site existant", regionX, regionZ);
             CfLogger.log("REGION_TOO_CLOSE ({},{})", regionX, regionZ);
@@ -99,43 +78,40 @@ public class AiCitySpawner {
 
     // ── PHASE 2 : MATÉRIALISATION ─────────────────────────────────────────
 
-    /**
-     * Crée la colonie MineColonies pour un site réservé.
-     * Les chunks autour du site doivent être chargés (appelé quand un joueur est à proximité).
-     */
     public static void materializeColony(ServerLevel level, AiCityData data,
                                           ServerPlayer player, AiCityRegistry registry) {
-        // Cherche la vraie surface autour du centre XZ réservé
-        BlockPos surface = findBestSurface(level, data.center.getX(), data.center.getZ(),
+        // Cherche une surface valide (biome sain + terrain plat)
+        BlockPos surface = findValidSurface(level, data.center.getX(), data.center.getZ(),
                 SURFACE_SEARCH_R);
 
         if (surface == null) {
-            LOG.warn("[CF:Spawner] matérialisation impossible en ({},{}) — pas de surface valide",
+            LOG.warn("[CF:Spawner] aucune surface valide autour de ({},{}) — site supprimé",
                     data.center.getX(), data.center.getZ());
-            CfLogger.log("MATERIALIZE_NO_SURFACE pos=({},{})", data.center.getX(), data.center.getZ());
-            // On garde le site réservé pour une tentative ultérieure
+            CfLogger.log("MATERIALIZE_NO_SURFACE ({},{}) — removed",
+                    data.center.getX(), data.center.getZ());
+            registry.removeCity(data);
             return;
         }
 
-        // Mise à jour du centre avec les vraies coordonnées de surface
-        data.center = surface;
-
         IColonyManager mgr = IMinecoloniesAPI.getInstance().getColonyManager();
         if (!mgr.isFarEnoughFromColonies(level, surface)) {
-            LOG.warn("[CF:Spawner] matérialisation refusée par MC en {} — site supprimé", surface);
+            LOG.warn("[CF:Spawner] MC refuse le placement en {} — site supprimé", surface);
             CfLogger.log("MATERIALIZE_MC_REFUSED pos={}", surface);
             registry.removeCity(data);
             return;
         }
 
-        String stylePack  = BiomeStyleMapper.getStyleFor(level, surface);
+        String stylePack = BiomeStyleMapper.getStyleFor(level, surface);
+        if (stylePack == null) {
+            // Ne devrait pas arriver (findValidSurface filtre déjà), sécurité
+            stylePack = "caledonia";
+        }
+
         String colonyName = "IA_" + data.archetype.name()
                 + "_" + surface.getX() + "_" + surface.getZ();
 
         IColony colony;
         try {
-            // On passe un joueur réel pour éviter le NPE interne de MineColonies.
-            // Le joueur est retiré des permissions après création (voir ci-dessous).
             colony = mgr.createColony(level, surface, player, colonyName, stylePack);
         } catch (Exception e) {
             LOG.error("[CF:Spawner] createColony échoué en {}: {}", surface, e.getMessage());
@@ -151,8 +127,7 @@ public class AiCitySpawner {
 
         colony.setStructurePack(stylePack);
 
-        // Retire le joueur déclencheur des permissions — la colonie IA n'appartient à personne.
-        // On le retire de la liste des membres et on le reclasse HOSTILE.
+        // Retire le joueur déclencheur — la colonie ne lui appartient pas
         try {
             colony.getPermissions().setPlayerRank(
                     player.getUUID(),
@@ -162,10 +137,17 @@ public class AiCitySpawner {
             LOG.warn("[CF:Spawner] setPlayerRank hostile échoué (non bloquant): {}", e.getMessage());
         }
 
+        data.center            = surface;
         data.colonyId          = colony.getID();
         data.lastEvolutionTick = level.getGameTime();
         registry.setDirty();
 
+        // Place le bloc Town Hall physique — sans ça MineColonies n'a pas de centre physique.
+        // C'est ce bloc qui déclenche l'enregistrement du bâtiment "townhall" dans la colonie.
+        BlockPos thPos = AiBlueprintPlacer.placeTownHall(level, surface, colony);
+        data.center = thPos; // met à jour avec la position exacte de surface
+
+        // Applique l'évolution correspondant au tier initial
         HybridEvolutionEngine.applyOfflineProgress(level, data, colony);
 
         LOG.info("[CF:Spawner] CITÉ CRÉÉE colonyId={} pos={} tier={} archetype={} style={}",
@@ -174,54 +156,56 @@ public class AiCitySpawner {
                 colony.getID(), surface, data.currentTier, data.archetype, stylePack);
     }
 
-    // ── HELPERS TERRAIN ───────────────────────────────────────────────────
+    // ── RECHERCHE DE SURFACE VALIDE ────────────────────────────────────────
+    // Biome sain (pas océan/glace) + terrain plat + bloc solide en dessous.
+    // Cherche en spirale depuis le centre.
 
-    /**
-     * Cherche la meilleure surface dans un carré de searchRadius autour de (cx, cz).
-     * Teste d'abord le centre, puis des anneaux concentriques.
-     * Retourne null seulement si aucune position valide dans tout le carré.
-     */
-    static BlockPos findBestSurface(ServerLevel level, int cx, int cz, int searchRadius) {
+    static BlockPos findValidSurface(ServerLevel level, int cx, int cz, int searchRadius) {
         // Centre d'abord
-        BlockPos center = findSurfacePos(level, cx, cz);
-        if (center != null && isFlatEnough(level, center)) return center;
+        BlockPos c = tryPos(level, cx, cz);
+        if (c != null) return c;
 
-        // Spirale en anneaux de 4 blocs
         for (int r = 4; r <= searchRadius; r += 4) {
             for (int dx = -r; dx <= r; dx += 4) {
-                BlockPos p = findSurfacePos(level, cx + dx, cz - r);
-                if (p != null && isFlatEnough(level, p)) return p;
-                p = findSurfacePos(level, cx + dx, cz + r);
-                if (p != null && isFlatEnough(level, p)) return p;
+                BlockPos p = tryPos(level, cx + dx, cz - r);
+                if (p != null) return p;
+                p = tryPos(level, cx + dx, cz + r);
+                if (p != null) return p;
             }
             for (int dz = -r + 4; dz <= r - 4; dz += 4) {
-                BlockPos p = findSurfacePos(level, cx - r, cz + dz);
-                if (p != null && isFlatEnough(level, p)) return p;
-                p = findSurfacePos(level, cx + r, cz + dz);
-                if (p != null && isFlatEnough(level, p)) return p;
+                BlockPos p = tryPos(level, cx - r, cz + dz);
+                if (p != null) return p;
+                p = tryPos(level, cx + r, cz + dz);
+                if (p != null) return p;
             }
         }
         return null;
     }
 
-    private static BlockPos findSurfacePos(ServerLevel level, int x, int z) {
+    private static BlockPos tryPos(ServerLevel level, int x, int z) {
+        // Vérifie biome avant de lire la heightmap (plus léger)
+        BlockPos probe = new BlockPos(x, 64, z);
+        String style = BiomeStyleMapper.getStyleFor(level, probe);
+        if (style == null) return null; // biome rejeté
+
         int y = level.getHeight(Heightmap.Types.WORLD_SURFACE_WG, x, z);
-        // getHeight retourne minBuildHeight si le chunk n'est pas chargé ou vide
         if (y <= level.getMinBuildHeight()) return null;
+
         BlockPos pos = new BlockPos(x, y, z);
         BlockState below = level.getBlockState(pos.below());
-        // Rejette eau, lave, air (falaises, vide)
         if (below.liquid() || below.isAir()) return null;
+
+        if (!isFlatEnough(level, pos)) return null;
         return pos;
     }
 
-    private static boolean isFlatEnough(ServerLevel level, BlockPos center) {
+    static boolean isFlatEnough(ServerLevel level, BlockPos center) {
         int baseY = center.getY();
         for (int dx = -FLATNESS_RADIUS; dx <= FLATNESS_RADIUS; dx += 2) {
             for (int dz = -FLATNESS_RADIUS; dz <= FLATNESS_RADIUS; dz += 2) {
                 int y = level.getHeight(Heightmap.Types.WORLD_SURFACE_WG,
                         center.getX() + dx, center.getZ() + dz);
-                if (y <= level.getMinBuildHeight()) return false; // chunk non chargé
+                if (y <= level.getMinBuildHeight()) return false;
                 if (Math.abs(y - baseY) > MAX_HEIGHT_DELTA) return false;
             }
         }

@@ -1,133 +1,173 @@
 package fr.gauthier.colonyfrontiers.ai.city;
 
 import com.minecolonies.api.colony.IColony;
+import com.minecolonies.api.colony.buildings.IBuilding;
+import fr.gauthier.colonyfrontiers.util.CfLogger;
 import net.minecraft.server.level.ServerLevel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.Map;
 
 /**
- * Moteur d'évolution hybride (GDD Module 1 — Anti-Lag).
+ * Moteur d'évolution hybride (GDD Module 1).
  *
- * Chunks non chargés :
- *   applyOfflineProgress() — calcul purement mathématique basé sur le temps écoulé.
- *   Zéro CPU, zéro entité. Détermine combien de bâtiments auraient été construits
- *   depuis la dernière mise à jour et avance buildIndex en conséquence.
+ * OFFLINE (applyOfflineProgress) :
+ *   Calcul mathématique pur — avance buildIndex selon le temps écoulé.
+ *   Aucune entité, aucun placement. Applique aussi le tier initial forcé.
+ *   Appelé à la matérialisation et à chaque catchup.
  *
- * Chunks chargés (joueur à proximité) :
- *   triggerOnlineCatchup() — rattrapage instantané des bâtiments complétés hors-ligne,
- *   puis activation du Builder natif MineColonies sur le prochain chantier actif.
+ * ONLINE (triggerOnlineCatchup) :
+ *   Appelé quand un joueur charge les chunks de la cité.
+ *   1. Rattrapage offline.
+ *   2. Pour chaque bâtiment du buildOrder jusqu'au buildIndex :
+ *      - Si absent → place le bloc hut via AiBlueprintPlacer → MineColonies
+ *        détecte le bloc et assigne automatiquement un Builder.
+ *      - Si présent mais niveau < target → requestUpgrade().
  *
- * Tiers de développement :
- *   Tier 1 : bâtiments 0–2   du buildOrder
- *   Tier 2 : bâtiments 3–5
- *   Tier 3 : bâtiments 6–8
- *   Tier 4 : bâtiments 9–11+ (cité complète)
+ * RÈGLE ANTI-LAG :
+ *   triggerOnlineCatchup ne place qu'UN bâtiment par appel.
+ *   L'EventHandler l'appelle une fois toutes les 20 ticks max.
  */
 public class HybridEvolutionEngine {
 
     private static final Logger LOG = LoggerFactory.getLogger("ColonyFrontiers/Evolution");
 
-    /**
-     * Ticks (temps in-game) nécessaires pour construire un bâtiment hors-ligne.
-     * 1 jour in-game = 24000 ticks. Un bâtiment prend ~2 jours.
-     */
-    private static final long TICKS_PER_OFFLINE_BUILD = 24000L * 2;
+    /** 2 jours in-game (48000 ticks) par bâtiment en mode offline. */
+    private static final long TICKS_PER_BUILD = 48_000L;
 
-    /**
-     * Calcule le progrès offline depuis la dernière mise à jour et
-     * avance buildIndex sans aucune logique de construction réelle.
-     * Appelé lors du spawn initial et lors du chargement d'une cité depuis NBT.
-     */
+    // ── OFFLINE ───────────────────────────────────────────────────────────
+
     public static void applyOfflineProgress(ServerLevel level, AiCityData data, IColony colony) {
         long now     = level.getGameTime();
         long elapsed = now - data.lastEvolutionTick;
-        if (elapsed <= 0) return;
 
-        List<String> buildOrder = data.archetype.buildOrder;
-        int maxIndex = buildOrder.size();
+        List<String> order  = data.archetype.buildOrder;
+        int          maxIdx = order.size();
 
-        // Combien de bâtiments auraient été construits pendant ce temps
-        int buildsCompleted = (int) (elapsed / TICKS_PER_OFFLINE_BUILD);
-        if (buildsCompleted <= 0) {
-            data.lastEvolutionTick = now;
-            return;
+        int targetIdx = tierToMinIndex(data.initialTier, maxIdx);
+        int gained    = (elapsed > 0) ? (int) Math.min(elapsed / TICKS_PER_BUILD,
+                                                         maxIdx - data.buildIndex) : 0;
+        int newIdx = Math.max(data.buildIndex + gained, targetIdx);
+        newIdx = Math.min(newIdx, maxIdx);
+
+        if (newIdx > data.buildIndex) {
+            LOG.info("[CF:Evolution] OFFLINE colonyId={} builds+{} idx {}→{} tier={}",
+                    data.colonyId, newIdx - data.buildIndex,
+                    data.buildIndex, newIdx, computeTier(newIdx, maxIdx));
+            CfLogger.log("OFFLINE_PROGRESS colonyId={} builds+{} idx={}→{} tier={}",
+                    data.colonyId, newIdx - data.buildIndex,
+                    data.buildIndex, newIdx, computeTier(newIdx, maxIdx));
         }
 
-        int oldIndex = data.buildIndex;
-        data.buildIndex = Math.min(data.buildIndex + buildsCompleted, maxIndex);
-        data.currentTier = computeTier(data.buildIndex, maxIndex);
+        data.buildIndex        = newIdx;
+        data.currentTier       = computeTier(newIdx, maxIdx);
         data.lastEvolutionTick = now;
-
-        LOG.info("[CF:Evolution] OFFLINE colonyId={} builds+{} index {}→{} tier={}",
-                data.colonyId, buildsCompleted, oldIndex, data.buildIndex, data.currentTier);
-
-        // Pour une cité au Tier 1-4 initial, on applique le tier de départ en forcant l'index
-        int targetIndex = tierToMinBuildIndex(data.initialTier, maxIndex);
-        if (data.buildIndex < targetIndex) {
-            data.buildIndex = targetIndex;
-            data.currentTier = data.initialTier;
-            LOG.info("[CF:Evolution] tier initial forcé colonyId={} index={} tier={}",
-                    data.colonyId, data.buildIndex, data.currentTier);
-        }
     }
 
+    // ── ONLINE ────────────────────────────────────────────────────────────
+
     /**
-     * Déclenché quand un joueur charge les chunks autour d'une cité.
-     * 1. Rattrapage instantané des bâtiments complétés hors-ligne
-     *    (via applyOfflineProgress).
-     * 2. Demande au Builder MineColonies de construire le prochain bâtiment
-     *    du buildOrder si la colonie a un Builder disponible.
+     * Déclenche le rattrapage + place UN bâtiment si nécessaire.
+     * Retourne true si un bâtiment a été placé/upgradé (pour réinitialiser le cooldown).
      */
-    public static void triggerOnlineCatchup(ServerLevel level, AiCityData data, IColony colony) {
-        // Rattrapage mathématique d'abord
+    public static boolean triggerOnlineCatchup(ServerLevel level, AiCityData data,
+                                                IColony colony) {
         applyOfflineProgress(level, data, colony);
 
-        List<String> buildOrder = data.archetype.buildOrder;
-        if (data.buildIndex >= buildOrder.size()) {
-            LOG.debug("[CF:Evolution] ONLINE colonyId={} — développement max atteint", data.colonyId);
-            return;
+        List<String> order = data.archetype.buildOrder;
+        if (data.buildIndex <= 0 || order.isEmpty()) return false;
+
+        // Place les bâtiments jusqu'au buildIndex (un par appel max)
+        for (int i = 0; i < data.buildIndex && i < order.size(); i++) {
+            String buildingId = order.get(i);
+            IBuilding existing = findBuildingByType(colony, buildingId);
+
+            int targetLevel = computeTargetLevel(i, data.buildIndex, order.size());
+
+            if (existing == null) {
+                // Bâtiment absent — place le bloc hut physique
+                boolean placed = AiBlueprintPlacer.placeBuilding(
+                        level, data.center, buildingId, i, colony);
+                if (placed) {
+                    LOG.info("[CF:Evolution] ONLINE PLACE colonyId={} building={} slot={}",
+                            data.colonyId, buildingId, i);
+                    return true; // Un seul par appel
+                }
+            } else if (existing.getBuildingLevel() < targetLevel
+                    && existing.getBuildingLevel() < existing.getMaxBuildingLevel()) {
+                // Bâtiment existant à un niveau insuffisant — demander upgrade
+                try {
+                    existing.requestUpgrade(null, existing.getPosition());
+                    LOG.info("[CF:Evolution] ONLINE UPGRADE colonyId={} building={} level→{}",
+                            data.colonyId, buildingId, existing.getBuildingLevel() + 1);
+                    CfLogger.log("ONLINE_UPGRADE colonyId={} building={} newLevel={}",
+                            data.colonyId, buildingId, existing.getBuildingLevel() + 1);
+                    return true;
+                } catch (Exception e) {
+                    LOG.warn("[CF:Evolution] requestUpgrade échoué {}: {}", buildingId, e.getMessage());
+                }
+            }
         }
-
-        // Prochain bâtiment à construire
-        String nextBuildingId = buildOrder.get(data.buildIndex);
-        LOG.info("[CF:Evolution] ONLINE colonyId={} — prochain bâtiment: {}",
-                data.colonyId, nextBuildingId);
-
-        // Demander une upgrade/construction au bâtiment existant le plus bas niveau
-        // via l'API MineColonies. On cherche le bâtiment du type dans la colonie
-        // et on demande son upgrade s'il est déjà présent, sinon on signale via le log
-        // que le Builder doit le créer (la pose physique nécessite le système de blueprint
-        // de Structurize, qui est géré côté MineColonies internalement).
-        requestNextBuild(colony, nextBuildingId, data, level);
+        return false;
     }
 
     // ── HELPERS ───────────────────────────────────────────────────────────
 
     /**
-     * Avance l'index de construction et log le prochain bâtiment à construire.
-     * L'upgrade physique via l'API MineColonies sera ajoutée quand la méthode
-     * correcte du BuildingManager sera identifiée dans le JAR.
+     * Niveau cible d'un bâtiment selon sa position dans le buildOrder.
+     * Les bâtiments placés tôt (< 25%) sont éligibles au niveau max.
+     * Les bâtiments récents (> 75% du buildIndex actuel) commencent au niveau 1.
      */
-    private static void requestNextBuild(IColony colony, String buildingTypeId,
-                                          AiCityData data, ServerLevel level) {
-        LOG.info("[CF:Evolution] prochain bâtiment: {} colonyId={}", buildingTypeId, colony.getID());
-        data.buildIndex++;
-        data.currentTier = computeTier(data.buildIndex, data.archetype.buildOrder.size());
-        data.lastEvolutionTick = level.getGameTime();
-    }
-
-    private static int computeTier(int buildIndex, int maxIndex) {
-        if (maxIndex <= 0) return 1;
-        float progress = (float) buildIndex / maxIndex;
-        if (progress >= 0.75f) return 4;
-        if (progress >= 0.50f) return 3;
-        if (progress >= 0.25f) return 2;
+    private static int computeTargetLevel(int slotIndex, int buildIndex, int maxIndex) {
+        if (buildIndex <= 0) return 1;
+        float relativeAge = 1.0f - ((float) slotIndex / buildIndex);
+        if (relativeAge > 0.75f) return 5;
+        if (relativeAge > 0.50f) return 3;
+        if (relativeAge > 0.25f) return 2;
         return 1;
     }
 
-    private static int tierToMinBuildIndex(int tier, int maxIndex) {
+    @SuppressWarnings("unchecked")
+    static IBuilding findBuildingByType(IColony colony, String buildingTypeId) {
+        try {
+            // Réflexion pour éviter les erreurs compile sur des méthodes non confirmées
+            Object manager = null;
+            for (String methodName : new String[]{
+                    "getServerBuildingManager", "getBuildingManager", "getBuildingDataManager"}) {
+                try {
+                    manager = colony.getClass().getMethod(methodName).invoke(colony);
+                    if (manager != null) break;
+                } catch (NoSuchMethodException ignored) {}
+            }
+            if (manager == null) return null;
+
+            Map<?, ?> buildings = (Map<?, ?>) manager.getClass()
+                    .getMethod("getBuildings").invoke(manager);
+            for (Object b : buildings.values()) {
+                if (!(b instanceof IBuilding building)) continue;
+                try {
+                    String key = building.getBuildingRegistryEntry().getKey().getPath();
+                    if (key.equals(buildingTypeId)) return building;
+                } catch (Exception ignored) {}
+            }
+        } catch (Exception e) {
+            LOG.debug("[CF:Evolution] findBuildingByType: {}", e.getMessage());
+        }
+        return null;
+    }
+
+    static int computeTier(int buildIndex, int maxIndex) {
+        if (maxIndex <= 0) return 1;
+        float p = (float) buildIndex / maxIndex;
+        if (p >= 0.75f) return 4;
+        if (p >= 0.50f) return 3;
+        if (p >= 0.25f) return 2;
+        return 1;
+    }
+
+    private static int tierToMinIndex(int tier, int maxIndex) {
         return switch (tier) {
             case 4 -> (int)(maxIndex * 0.75f);
             case 3 -> (int)(maxIndex * 0.50f);

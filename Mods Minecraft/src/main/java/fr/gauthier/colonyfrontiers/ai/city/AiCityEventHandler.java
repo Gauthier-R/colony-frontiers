@@ -43,16 +43,21 @@ public class AiCityEventHandler {
     /** File des régions à évaluer (coordonnées de région, pas de bloc). */
     private static final Queue<long[]> pendingRegions      = new ArrayDeque<>();
     /** File des sites à matérialiser : (centre du site, UUID du joueur déclencheur). */
-    private static final Queue<long[]> pendingMaterialize = new ArrayDeque<>();
+    private static final Queue<long[]> pendingMaterialize  = new ArrayDeque<>();
+    /** File des cités à rattraper (online catchup — place les bâtiments manquants). */
+    private static final Queue<Integer> pendingCatchup     = new ArrayDeque<>();
 
-    /** Rayon en blocs pour déclencher la matérialisation. */
+    /** Rayon en blocs pour déclencher la matérialisation et le catchup. */
     private static final int MATERIALIZE_RADIUS = 300;
     /**
      * Intervalle en ticks entre deux matérialisations.
      * 200 ticks = 10 secondes — laisse le serveur respirer entre deux createColony.
      */
     private static final int MATERIALIZE_COOLDOWN = 200;
+    /** Intervalle entre deux placements de bâtiments (une construction visible à la fois). */
+    private static final int CATCHUP_COOLDOWN     = 40; // 2 secondes
     private static int materializeCooldown = 0;
+    private static int catchupCooldown     = 0;
 
     // ── WORLD LOAD ────────────────────────────────────────────────────────
 
@@ -61,10 +66,11 @@ public class AiCityEventHandler {
         if (!(event.getLevel() instanceof ServerLevel level)) return;
         if (!level.dimension().equals(net.minecraft.world.level.Level.OVERWORLD)) return;
 
-        // Vide les files au cas où le serveur a redémarré sans décharger les statics
         pendingRegions.clear();
         pendingMaterialize.clear();
+        pendingCatchup.clear();
         materializeCooldown = 0;
+        catchupCooldown     = 0;
 
         AiCityRegistry registry = AiCityRegistry.get(level);
         long total = registry.getCities().size();
@@ -116,6 +122,15 @@ public class AiCityEventHandler {
                     .anyMatch(e -> e[0] == key);
             if (!alreadyQueued) {
                 pendingMaterialize.offer(new long[]{ key, playerUuidMost, playerUuidLeast });
+            }
+        }
+
+        // Catchup online — mise en file pour les cités matérialisées à portée
+        for (AiCityData data : registry.getCities()) {
+            if (data.colonyId == -1) continue;
+            if (data.center.distSqr(chunkCenter) > (long) MATERIALIZE_RADIUS * MATERIALIZE_RADIUS) continue;
+            if (!pendingCatchup.contains(data.colonyId)) {
+                pendingCatchup.offer(data.colonyId);
             }
         }
     }
@@ -189,6 +204,31 @@ public class AiCityEventHandler {
                 materializeCooldown = MATERIALIZE_COOLDOWN;
             }
             return;
+        }
+
+        // Catchup online — place UN bâtiment par cooldown
+        if (catchupCooldown > 0) {
+            catchupCooldown--;
+        } else if (!pendingCatchup.isEmpty()) {
+            int colonyId = pendingCatchup.poll();
+            AiCityData data = registry.getByColonyId(colonyId);
+            if (data != null) {
+                IColony colony = IMinecoloniesAPI.getInstance().getColonyManager()
+                        .getColonyByWorld(colonyId, overworld);
+                if (colony != null) {
+                    try {
+                        boolean acted = HybridEvolutionEngine.triggerOnlineCatchup(
+                                overworld, data, colony);
+                        if (acted) {
+                            registry.setDirty();
+                            catchupCooldown = CATCHUP_COOLDOWN;
+                        }
+                    } catch (Exception e) {
+                        LOG.error("[CF:CityEvents] catchup échoué colonyId={}: {}", colonyId, e.getMessage());
+                        CfLogger.log("CATCHUP_ERROR colonyId={} err={}", colonyId, e.getMessage());
+                    }
+                }
+            }
         }
 
         // Boss respawn timer
