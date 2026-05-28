@@ -1,7 +1,6 @@
 package fr.gauthier.colonyfrontiers.ai.city;
 
 import com.minecolonies.api.colony.IColony;
-import com.minecolonies.api.colony.buildings.IBuilding;
 import net.minecraft.server.level.ServerLevel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -107,48 +106,16 @@ public class HybridEvolutionEngine {
     // ── HELPERS ───────────────────────────────────────────────────────────
 
     /**
-     * Demande la construction ou l'upgrade du prochain bâtiment dans la colonie.
-     * Si le bâtiment existe déjà à niveau < 5, demande une upgrade.
-     * Avance buildIndex une fois la requête émise.
+     * Avance l'index de construction et log le prochain bâtiment à construire.
+     * L'upgrade physique via l'API MineColonies sera ajoutée quand la méthode
+     * correcte du BuildingManager sera identifiée dans le JAR.
      */
     private static void requestNextBuild(IColony colony, String buildingTypeId,
                                           AiCityData data, ServerLevel level) {
-        try {
-            // Cherche un bâtiment de ce type dans la colonie
-            IBuilding existing = colony.getServerBuildingManager()
-                    .getBuildings().values().stream()
-                    .filter(b -> {
-                        try {
-                            String typeKey = b.getBuildingRegistryEntry().getKey().getPath();
-                            return typeKey.equals(buildingTypeId);
-                        } catch (Exception ex) { return false; }
-                    })
-                    .filter(b -> b.getBuildingLevel() < b.getMaxBuildingLevel())
-                    .findFirst().orElse(null);
-
-            if (existing != null) {
-                // Upgrade le bâtiment existant
-                existing.requestUpgrade(null, existing.getPosition());
-                LOG.info("[CF:Evolution] upgrade demandée building={} level={}→{}",
-                        buildingTypeId, existing.getBuildingLevel(),
-                        existing.getBuildingLevel() + 1);
-            } else {
-                // Le bâtiment n'existe pas encore dans la colonie —
-                // MineColonies doit le placer. On log pour visibilité ;
-                // la création physique est déléguée au système de blueprint interne.
-                LOG.info("[CF:Evolution] construction requise building={} colonyId={}",
-                        buildingTypeId, colony.getID());
-            }
-
-            // Avance l'index dans tous les cas (évite les boucles infinies sur bâtiments max)
-            data.buildIndex++;
-            data.currentTier = computeTier(data.buildIndex, data.archetype.buildOrder.size());
-            data.lastEvolutionTick = level.getGameTime();
-
-        } catch (Exception e) {
-            LOG.error("[CF:Evolution] erreur requestNextBuild building={}: {}",
-                    buildingTypeId, e.getMessage());
-        }
+        LOG.info("[CF:Evolution] prochain bâtiment: {} colonyId={}", buildingTypeId, colony.getID());
+        data.buildIndex++;
+        data.currentTier = computeTier(data.buildIndex, data.archetype.buildOrder.size());
+        data.lastEvolutionTick = level.getGameTime();
     }
 
     private static int computeTier(int buildIndex, int maxIndex) {

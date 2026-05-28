@@ -38,7 +38,7 @@ public class GuardFollowEvent {
 
     // ── HELPERS ────────────────────────────────────────────────────────────
 
-    static boolean isGuard(AbstractEntityCitizen c) {
+    public static boolean isGuard(AbstractEntityCitizen c) {
         return c.getCitizenData() != null
                 && c.getCitizenData().getJob() != null
                 && c.getCitizenData().getJob().isGuard();
@@ -50,7 +50,7 @@ public class GuardFollowEvent {
         citizen.setGlowingTag(true);
     }
 
-    static void dismissGuard(AbstractEntityCitizen citizen) {
+    public static void dismissGuard(AbstractEntityCitizen citizen) {
         citizen.getPersistentData().remove("FollowTarget");
         citizen.getPersistentData().putBoolean("ForcedRetreat", false);
         citizen.getPersistentData().remove("PriorityTarget");
