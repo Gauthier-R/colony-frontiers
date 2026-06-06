@@ -174,10 +174,10 @@ public class AiBlueprintPlacer {
      * - Aplanit 1 bloc si nécessaire
      */
     private static BlockPos findGroundPos(ServerLevel level, BlockPos hint) {
+        // MOTION_BLOCKING_NO_LEAVES ignore feuilles et végétation haute
         int y = level.getHeight(
-                net.minecraft.world.level.levelgen.Heightmap.Types.WORLD_SURFACE_WG,
+                net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
                 hint.getX(), hint.getZ());
-        // Sur superflat y=4, on pose le bloc à y=4 (sur la surface)
         y = Math.max(level.getMinBuildHeight() + 1, y);
         return new BlockPos(hint.getX(), y, hint.getZ());
     }

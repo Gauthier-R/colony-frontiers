@@ -164,15 +164,22 @@ public class AiCitySpawner {
 
     private static void spawnInitialCitizens(ServerLevel level, IColony colony, AiCityData data) {
         try {
-            // Tier 1 : 2 citoyens, Tier 2 : 4, Tier 3 : 6, Tier 4 : 8
-            int count = data.currentTier * 2;
+            int count = data.currentTier * 2; // Tier 1=2, 2=4, 3=6, 4=8
             for (int i = 0; i < count; i++) {
-                colony.getCitizenManager().spawnOrCreateCitizen();
+                colony.getCitizenManager().spawnOrCreateCitizen(null, level, data.center);
             }
             LOG.info("[CF:Spawner] {} citoyens spawnés colonyId={}", count, colony.getID());
             CfLogger.log("SPAWN_CITIZENS count={} colonyId={}", count, colony.getID());
         } catch (Exception e) {
-            LOG.warn("[CF:Spawner] spawn citoyens échoué: {}", e.getMessage());
+            // Fallback signature sans position
+            try {
+                int count = data.currentTier * 2;
+                for (int i = 0; i < count; i++) {
+                    colony.getCitizenManager().spawnOrCreateCitizen();
+                }
+            } catch (Exception e2) {
+                LOG.warn("[CF:Spawner] spawn citoyens échoué: {}", e2.getMessage());
+            }
         }
     }
 
@@ -181,18 +188,17 @@ public class AiCitySpawner {
     // Cherche en spirale depuis le centre.
 
     static BlockPos findValidSurface(ServerLevel level, int cx, int cz, int searchRadius) {
-        // Centre d'abord
         BlockPos c = tryPos(level, cx, cz);
         if (c != null) return c;
 
-        for (int r = 4; r <= searchRadius; r += 4) {
-            for (int dx = -r; dx <= r; dx += 4) {
+        for (int r = 8; r <= searchRadius; r += 8) {
+            for (int dx = -r; dx <= r; dx += 8) {
                 BlockPos p = tryPos(level, cx + dx, cz - r);
                 if (p != null) return p;
                 p = tryPos(level, cx + dx, cz + r);
                 if (p != null) return p;
             }
-            for (int dz = -r + 4; dz <= r - 4; dz += 4) {
+            for (int dz = -r + 8; dz <= r - 8; dz += 8) {
                 BlockPos p = tryPos(level, cx - r, cz + dz);
                 if (p != null) return p;
                 p = tryPos(level, cx + r, cz + dz);
@@ -203,19 +209,17 @@ public class AiCitySpawner {
     }
 
     private static BlockPos tryPos(ServerLevel level, int x, int z) {
-        // Vérifie biome avant de lire la heightmap (plus léger)
         BlockPos probe = new BlockPos(x, 64, z);
         String style = BiomeStyleMapper.getStyleFor(level, probe);
-        if (style == null) return null; // biome rejeté
+        if (style == null) return null;
 
-        int y = level.getHeight(Heightmap.Types.WORLD_SURFACE_WG, x, z);
+        // MOTION_BLOCKING_NO_LEAVES ignore feuilles/végétation haute
+        int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
         if (y <= level.getMinBuildHeight()) return null;
 
         BlockPos pos = new BlockPos(x, y, z);
         BlockState below = level.getBlockState(pos.below());
         if (below.liquid() || below.isAir()) return null;
-
-        if (!isFlatEnough(level, pos)) return null;
         return pos;
     }
 
@@ -223,7 +227,7 @@ public class AiCitySpawner {
         int baseY = center.getY();
         for (int dx = -FLATNESS_RADIUS; dx <= FLATNESS_RADIUS; dx += 2) {
             for (int dz = -FLATNESS_RADIUS; dz <= FLATNESS_RADIUS; dz += 2) {
-                int y = level.getHeight(Heightmap.Types.WORLD_SURFACE_WG,
+                int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
                         center.getX() + dx, center.getZ() + dz);
                 if (y <= level.getMinBuildHeight()) return false;
                 if (Math.abs(y - baseY) > MAX_HEIGHT_DELTA) return false;

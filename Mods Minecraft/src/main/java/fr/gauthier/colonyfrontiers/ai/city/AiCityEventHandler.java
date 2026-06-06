@@ -135,6 +135,35 @@ public class AiCityEventHandler {
         }
     }
 
+    // ── PLAYER TICK — vérifie région autour du joueur toutes les 5s ─────────
+    // Complément à onChunkLoad : capte les régions que le joueur survole vite.
+
+    @SubscribeEvent
+    public static void onPlayerTick(TickEvent.PlayerTickEvent event) {
+        if (event.phase != TickEvent.Phase.END) return;
+        if (event.player.level().isClientSide()) return;
+        if (event.player.tickCount % 100 != 0) return; // toutes les 5s
+
+        if (!(event.player.level() instanceof ServerLevel level)) return;
+        if (!level.dimension().equals(net.minecraft.world.level.Level.OVERWORLD)) return;
+
+        AiCityRegistry registry = AiCityRegistry.get(level);
+        BlockPos pos = event.player.blockPosition();
+        int rX = AiCityRegistry.regionX(pos);
+        int rZ = AiCityRegistry.regionZ(pos);
+
+        // Vérifie la région courante et les 8 régions adjacentes
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                int rx = rX + dx, rz = rZ + dz;
+                if (!registry.isRegionChecked(rx, rz)) {
+                    registry.markRegionChecked(rx, rz);
+                    pendingRegions.offer(new long[]{ rx, rz });
+                }
+            }
+        }
+    }
+
     // ── SERVER TICK — traitement des files, UNE opération par tick ────────
 
     @SubscribeEvent
