@@ -23,17 +23,33 @@ public class CfLogger {
     private static Path logFile = null;
 
     public static void init(Path gameDir) {
+        // Cherche le bon répertoire de logs dans cet ordre :
+        // 1. gameDir/logs/ (FMLPaths.GAMEDIR = répertoire de travail Forge)
+        // 2. ./logs/        (répertoire courant du processus Java)
+        Path resolved = tryInitDir(gameDir.resolve("logs"));
+        if (resolved == null) resolved = tryInitDir(Paths.get("logs"));
+        if (resolved == null) resolved = tryInitDir(Paths.get("run", "logs"));
+        if (resolved == null) {
+            System.err.println("[CF:Logger] Aucun répertoire de logs trouvé. gameDir=" + gameDir);
+        }
+    }
+
+    private static Path tryInitDir(Path logDir) {
         try {
-            Path logDir = gameDir.resolve("logs");
             Files.createDirectories(logDir);
-            logFile = logDir.resolve("colonyfrontiers.log");
-            // Repart d'un fichier vide à chaque démarrage
-            Files.writeString(logFile, "=== Colony Frontiers Log — " +
-                    LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
-                    + " ===\n", StandardCharsets.UTF_8, StandardOpenOption.CREATE,
+            Path f = logDir.resolve("colonyfrontiers.log");
+            Files.writeString(f,
+                    "=== Colony Frontiers Log — "
+                    + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+                    + " ===\n",
+                    StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE,
                     StandardOpenOption.TRUNCATE_EXISTING);
+            logFile = f;
+            System.out.println("[CF:Logger] Log initialisé : " + f.toAbsolutePath());
+            return logDir;
         } catch (IOException e) {
-            System.err.println("[CF:Logger] Impossible de créer le fichier log : " + e.getMessage());
+            return null;
         }
     }
 
