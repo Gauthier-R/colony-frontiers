@@ -78,6 +78,21 @@ public class AiCityEventHandler {
 
         LOG.info("[CF:CityEvents] Monde chargé — {} cités ({} matérialisées)", total, mat);
         CfLogger.log("WORLD_LOAD cities={} materialized={}", total, mat);
+
+        // Pré-scan 7×7 régions autour du spawn pour garantir des villages proches
+        BlockPos spawn = level.getSharedSpawnPos();
+        int spawnRX = AiCityRegistry.regionX(spawn);
+        int spawnRZ = AiCityRegistry.regionZ(spawn);
+        for (int dx = -3; dx <= 3; dx++) {
+            for (int dz = -3; dz <= 3; dz++) {
+                int rx = spawnRX + dx, rz = spawnRZ + dz;
+                if (!registry.isRegionChecked(rx, rz)) {
+                    registry.markRegionChecked(rx, rz);
+                    pendingRegions.offer(new long[]{ rx, rz });
+                }
+            }
+        }
+        LOG.info("[CF:CityEvents] Pré-scan spawn: {} régions en file", pendingRegions.size());
     }
 
     // ── CHUNK LOAD — UNIQUEMENT des ajouts en file, RIEN de coûteux ──────
@@ -142,7 +157,7 @@ public class AiCityEventHandler {
     public static void onPlayerTick(TickEvent.PlayerTickEvent event) {
         if (event.phase != TickEvent.Phase.END) return;
         if (event.player.level().isClientSide()) return;
-        if (event.player.tickCount % 100 != 0) return; // toutes les 5s
+        if (event.player.tickCount % 40 != 0) return; // toutes les 2s
 
         if (!(event.player.level() instanceof ServerLevel level)) return;
         if (!level.dimension().equals(net.minecraft.world.level.Level.OVERWORLD)) return;

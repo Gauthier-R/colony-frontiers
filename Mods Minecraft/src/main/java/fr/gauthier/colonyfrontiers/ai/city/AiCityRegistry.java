@@ -30,7 +30,7 @@ public class AiCityRegistry extends SavedData {
     private static final String DATA_NAME = "colonyfrontiers_cities";
 
     /** Taille d'une région en blocs. Une cité max par région. */
-    public static final int REGION_SIZE = 1500;
+    public static final int REGION_SIZE = 600;
 
     /** Probabilité qu'une région contienne une cité (0.0–1.0). */
     public static final float SPAWN_CHANCE = 0.85f;

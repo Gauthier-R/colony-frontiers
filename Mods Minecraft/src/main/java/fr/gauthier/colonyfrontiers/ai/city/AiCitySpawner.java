@@ -219,7 +219,11 @@ public class AiCitySpawner {
 
         BlockPos pos = new BlockPos(x, y, z);
         BlockState below = level.getBlockState(pos.below());
+        // Rejette eau, lave, air (falaise) et neige/glace au sol
         if (below.liquid() || below.isAir()) return null;
+        // Rejette aussi si le bloc lui-même est de l'eau (surface d'un lac)
+        BlockState atPos = level.getBlockState(pos);
+        if (atPos.liquid()) return null;
         return pos;
     }
 
