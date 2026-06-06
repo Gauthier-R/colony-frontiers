@@ -14,27 +14,24 @@ import java.util.Map;
  * Moteur d'évolution hybride (GDD Module 1).
  *
  * OFFLINE (applyOfflineProgress) :
- *   Calcul mathématique pur — avance buildIndex selon le temps écoulé.
- *   Aucune entité, aucun placement. Applique aussi le tier initial forcé.
- *   Appelé à la matérialisation et à chaque catchup.
+ *   Calcul mathématique — avance buildIndex selon ticks écoulés + tier initial forcé.
+ *   N'affecte PAS physicalBuildIndex.
  *
  * ONLINE (triggerOnlineCatchup) :
- *   Appelé quand un joueur charge les chunks de la cité.
- *   1. Rattrapage offline.
- *   2. Pour chaque bâtiment du buildOrder jusqu'au buildIndex :
- *      - Si absent → place le bloc hut via AiBlueprintPlacer → MineColonies
- *        détecte le bloc et assigne automatiquement un Builder.
- *      - Si présent mais niveau < target → requestUpgrade().
+ *   Appelé depuis onServerTick (une fois par cooldown).
+ *   Place physiquement UN bâtiment du buildOrder si physicalBuildIndex < buildIndex.
+ *   Le buildOrder commence à l'index 1 (index 0 = townhall, déjà posé par AiCitySpawner).
  *
- * RÈGLE ANTI-LAG :
- *   triggerOnlineCatchup ne place qu'UN bâtiment par appel.
- *   L'EventHandler l'appelle une fois toutes les 20 ticks max.
+ * Règle fondamentale :
+ *   townhall (index 0) est toujours sauté par triggerOnlineCatchup.
+ *   Il est posé une seule fois par AiCitySpawner.materializeColony.
+ *   On ne passe jamais par findBuildingByType pour le townhall.
  */
 public class HybridEvolutionEngine {
 
     private static final Logger LOG = LoggerFactory.getLogger("ColonyFrontiers/Evolution");
 
-    /** 2 jours in-game (48000 ticks) par bâtiment en mode offline. */
+    /** 2 jours in-game par bâtiment en mode offline. */
     private static final long TICKS_PER_BUILD = 48_000L;
 
     // ── OFFLINE ───────────────────────────────────────────────────────────
@@ -46,9 +43,11 @@ public class HybridEvolutionEngine {
         List<String> order  = data.archetype.buildOrder;
         int          maxIdx = order.size();
 
+        // Tier initial : force un buildIndex minimum
         int targetIdx = tierToMinIndex(data.initialTier, maxIdx);
-        int gained    = (elapsed > 0) ? (int) Math.min(elapsed / TICKS_PER_BUILD,
-                                                         maxIdx - data.buildIndex) : 0;
+
+        int gained = (elapsed > 0) ? (int) Math.min(elapsed / TICKS_PER_BUILD,
+                                                      maxIdx - data.buildIndex) : 0;
         int newIdx = Math.max(data.buildIndex + gained, targetIdx);
         newIdx = Math.min(newIdx, maxIdx);
 
@@ -69,57 +68,68 @@ public class HybridEvolutionEngine {
     // ── ONLINE ────────────────────────────────────────────────────────────
 
     /**
-     * Déclenche le rattrapage + place UN bâtiment si nécessaire.
-     * Retourne true si un bâtiment a été placé/upgradé (pour réinitialiser le cooldown).
+     * Place UN bâtiment physique si physicalBuildIndex < buildIndex.
+     * Retourne true si un bâtiment a été traité (pour déclencher le cooldown).
      */
     public static boolean triggerOnlineCatchup(ServerLevel level, AiCityData data,
                                                 IColony colony) {
+        // Rattrapage du temps écoulé depuis la dernière visite
         applyOfflineProgress(level, data, colony);
 
         List<String> order = data.archetype.buildOrder;
-        if (data.buildIndex <= 0 || order.isEmpty()) return false;
 
-        // Place les bâtiments jusqu'au buildIndex (un par appel max)
-        for (int i = 0; i < data.buildIndex && i < order.size(); i++) {
-            String buildingId = order.get(i);
-            IBuilding existing = findBuildingByType(colony, buildingId);
+        // L'index 0 est toujours "townhall" — déjà posé, on commence à 1
+        if (data.physicalBuildIndex < 1) data.physicalBuildIndex = 1;
 
-            int targetLevel = computeTargetLevel(i, data.buildIndex, order.size());
+        if (data.physicalBuildIndex >= data.buildIndex
+                || data.physicalBuildIndex >= order.size()) {
+            return false; // Tout est à jour
+        }
 
-            if (existing == null) {
-                // Bâtiment absent — place le bloc hut physique
-                boolean placed = AiBlueprintPlacer.placeBuilding(
-                        level, data.center, buildingId, i, colony);
-                if (placed) {
-                    LOG.info("[CF:Evolution] ONLINE PLACE colonyId={} building={} slot={}",
-                            data.colonyId, buildingId, i);
-                    return true; // Un seul par appel
-                }
-            } else if (existing.getBuildingLevel() < targetLevel
+        String buildingId = order.get(data.physicalBuildIndex);
+
+        // Skip sécurité : ne jamais re-poser le townhall
+        if (buildingId.equals("townhall")) {
+            data.physicalBuildIndex++;
+            return true;
+        }
+
+        // Vérifie si le bâtiment existe déjà en monde (bloc hut présent)
+        IBuilding existing = findBuildingByType(colony, buildingId);
+
+        if (existing != null) {
+            // Bloc déjà posé — vérifier si upgrade nécessaire
+            int targetLevel = computeTargetLevel(data.physicalBuildIndex,
+                    data.buildIndex, order.size());
+            if (existing.getBuildingLevel() < targetLevel
                     && existing.getBuildingLevel() < existing.getMaxBuildingLevel()) {
-                // Bâtiment existant à un niveau insuffisant — demander upgrade
                 try {
                     existing.requestUpgrade(null, existing.getPosition());
-                    LOG.info("[CF:Evolution] ONLINE UPGRADE colonyId={} building={} level→{}",
+                    LOG.info("[CF:Evolution] UPGRADE colonyId={} building={} level→{}",
                             data.colonyId, buildingId, existing.getBuildingLevel() + 1);
                     CfLogger.log("ONLINE_UPGRADE colonyId={} building={} newLevel={}",
                             data.colonyId, buildingId, existing.getBuildingLevel() + 1);
-                    return true;
                 } catch (Exception e) {
                     LOG.warn("[CF:Evolution] requestUpgrade échoué {}: {}", buildingId, e.getMessage());
                 }
             }
+            data.physicalBuildIndex++;
+            return true;
         }
-        return false;
+
+        // Bâtiment absent — le placer physiquement
+        boolean placed = AiBlueprintPlacer.placeBuilding(
+                level, data.center, buildingId, data.physicalBuildIndex, colony);
+        if (placed) {
+            data.physicalBuildIndex++;
+            LOG.info("[CF:Evolution] PLACE colonyId={} building={} slot={}",
+                    data.colonyId, buildingId, data.physicalBuildIndex - 1);
+        }
+        return placed;
     }
 
     // ── HELPERS ───────────────────────────────────────────────────────────
 
-    /**
-     * Niveau cible d'un bâtiment selon sa position dans le buildOrder.
-     * Les bâtiments placés tôt (< 25%) sont éligibles au niveau max.
-     * Les bâtiments récents (> 75% du buildIndex actuel) commencent au niveau 1.
-     */
     private static int computeTargetLevel(int slotIndex, int buildIndex, int maxIndex) {
         if (buildIndex <= 0) return 1;
         float relativeAge = 1.0f - ((float) slotIndex / buildIndex);
@@ -132,12 +142,11 @@ public class HybridEvolutionEngine {
     @SuppressWarnings("unchecked")
     static IBuilding findBuildingByType(IColony colony, String buildingTypeId) {
         try {
-            // Réflexion pour éviter les erreurs compile sur des méthodes non confirmées
             Object manager = null;
-            for (String methodName : new String[]{
-                    "getServerBuildingManager", "getBuildingManager", "getBuildingDataManager"}) {
+            for (String m : new String[]{
+                    "getServerBuildingManager", "getBuildingManager"}) {
                 try {
-                    manager = colony.getClass().getMethod(methodName).invoke(colony);
+                    manager = colony.getClass().getMethod(m).invoke(colony);
                     if (manager != null) break;
                 } catch (NoSuchMethodException ignored) {}
             }
@@ -148,12 +157,10 @@ public class HybridEvolutionEngine {
             for (Object b : buildings.values()) {
                 if (!(b instanceof IBuilding building)) continue;
                 try {
-                    // getBuildingRegistryEntry() n'est pas dans l'API publique compilable
-                    // — on passe par réflexion pour obtenir la clé de registre du bâtiment.
                     Object entry = building.getClass()
                             .getMethod("getBuildingRegistryEntry").invoke(building);
-                    Object rl = entry.getClass().getMethod("getKey").invoke(entry);
-                    String path = (String) rl.getClass().getMethod("getPath").invoke(rl);
+                    Object rl    = entry.getClass().getMethod("getKey").invoke(entry);
+                    String path  = (String) rl.getClass().getMethod("getPath").invoke(rl);
                     if (path.equals(buildingTypeId)) return building;
                 } catch (Exception ignored) {}
             }

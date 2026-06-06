@@ -139,21 +139,41 @@ public class AiCitySpawner {
 
         data.center            = surface;
         data.colonyId          = colony.getID();
+        // physicalBuildIndex = 1 : le TH (index 0) sera compté comme posé
+        data.physicalBuildIndex = 1;
         data.lastEvolutionTick = level.getGameTime();
         registry.setDirty();
 
-        // Place le bloc Town Hall physique — sans ça MineColonies n'a pas de centre physique.
-        // C'est ce bloc qui déclenche l'enregistrement du bâtiment "townhall" dans la colonie.
-        BlockPos thPos = AiBlueprintPlacer.placeTownHall(level, surface, colony);
-        data.center = thPos; // met à jour avec la position exacte de surface
+        // Place le bloc Town Hall à EXACTEMENT la position déclarée à createColony.
+        // MineColonies associe la colonie au bloc via ses coordonnées — ils doivent coïncider.
+        AiBlueprintPlacer.placeTownHall(level, surface, colony);
 
-        // Applique l'évolution correspondant au tier initial
+        // Applique l'évolution correspondant au tier initial (calcul offline)
         HybridEvolutionEngine.applyOfflineProgress(level, data, colony);
+
+        // Spawne les citoyens initiaux (builder en priorité)
+        spawnInitialCitizens(level, colony, data);
 
         LOG.info("[CF:Spawner] CITÉ CRÉÉE colonyId={} pos={} tier={} archetype={} style={}",
                 colony.getID(), surface, data.currentTier, data.archetype, stylePack);
         CfLogger.log("CITY_CREATED colonyId={} pos={} tier={} archetype={} style={}",
                 colony.getID(), surface, data.currentTier, data.archetype, stylePack);
+    }
+
+    // ── SPAWN CITOYENS INITIAUX ───────────────────────────────────────────
+
+    private static void spawnInitialCitizens(ServerLevel level, IColony colony, AiCityData data) {
+        try {
+            // Tier 1 : 2 citoyens, Tier 2 : 4, Tier 3 : 6, Tier 4 : 8
+            int count = data.currentTier * 2;
+            for (int i = 0; i < count; i++) {
+                colony.getCitizenManager().spawnOrCreateCitizen();
+            }
+            LOG.info("[CF:Spawner] {} citoyens spawnés colonyId={}", count, colony.getID());
+            CfLogger.log("SPAWN_CITIZENS count={} colonyId={}", count, colony.getID());
+        } catch (Exception e) {
+            LOG.warn("[CF:Spawner] spawn citoyens échoué: {}", e.getMessage());
+        }
     }
 
     // ── RECHERCHE DE SURFACE VALIDE ────────────────────────────────────────

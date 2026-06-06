@@ -24,8 +24,14 @@ public class AiCityData {
     // ── Évolution ────────────────────────────────────────────────────────
     /** Tier actuel de développement (1–4). Évolue via HybridEvolutionEngine. */
     public int currentTier;
-    /** Index dans buildOrder de l'archétype — prochain bâtiment à construire. */
+    /** Index dans buildOrder calculé offline (combien ont "passé" mathématiquement). */
     public int buildIndex = 0;
+    /**
+     * Index des bâtiments PHYSIQUEMENT posés dans le monde.
+     * Toujours ≤ buildIndex. Avancé uniquement par AiBlueprintPlacer.
+     * Empêche le re-pose infini du même bâtiment.
+     */
+    public int physicalBuildIndex = 0;
     /** Timestamp serveur (en ticks) de la dernière mise à jour d'évolution. */
     public long lastEvolutionTick = 0L;
 
@@ -59,7 +65,8 @@ public class AiCityData {
         tag.putString("archetype",      archetype.name());
         tag.putInt("initialTier",       initialTier);
         tag.putInt("currentTier",       currentTier);
-        tag.putInt("buildIndex",        buildIndex);
+        tag.putInt("buildIndex",          buildIndex);
+        tag.putInt("physicalBuildIndex",  physicalBuildIndex);
         tag.putLong("lastEvolutionTick",lastEvolutionTick);
         tag.putBoolean("bossDefeated",  bossDefeated);
         tag.putInt("bossRespawnTicks",  bossRespawnTicks);
@@ -76,7 +83,8 @@ public class AiCityData {
         d.archetype         = AiColonyArchetype.valueOf(tag.getString("archetype"));
         d.initialTier       = tag.getInt("initialTier");
         d.currentTier       = tag.getInt("currentTier");
-        d.buildIndex        = tag.getInt("buildIndex");
+        d.buildIndex          = tag.getInt("buildIndex");
+        d.physicalBuildIndex  = tag.getInt("physicalBuildIndex");
         d.lastEvolutionTick = tag.getLong("lastEvolutionTick");
         d.bossDefeated      = tag.getBoolean("bossDefeated");
         d.bossRespawnTicks  = tag.getInt("bossRespawnTicks");
