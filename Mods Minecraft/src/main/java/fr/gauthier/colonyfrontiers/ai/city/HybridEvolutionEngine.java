@@ -148,8 +148,13 @@ public class HybridEvolutionEngine {
             for (Object b : buildings.values()) {
                 if (!(b instanceof IBuilding building)) continue;
                 try {
-                    String key = building.getBuildingRegistryEntry().getKey().getPath();
-                    if (key.equals(buildingTypeId)) return building;
+                    // getBuildingRegistryEntry() n'est pas dans l'API publique compilable
+                    // — on passe par réflexion pour obtenir la clé de registre du bâtiment.
+                    Object entry = building.getClass()
+                            .getMethod("getBuildingRegistryEntry").invoke(building);
+                    Object rl = entry.getClass().getMethod("getKey").invoke(entry);
+                    String path = (String) rl.getClass().getMethod("getPath").invoke(rl);
+                    if (path.equals(buildingTypeId)) return building;
                 } catch (Exception ignored) {}
             }
         } catch (Exception e) {
