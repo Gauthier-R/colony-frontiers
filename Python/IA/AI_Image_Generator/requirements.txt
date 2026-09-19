@@ -1,8 +1,0 @@
-torch==2.0.1
-torchvision==0.15.2
-torchaudio==2.0.2
-diffusers==0.18.2
-flask==2.3.2
-pillow==9.5.0
-accelerate==0.20.3
-transformers==4.32.0
